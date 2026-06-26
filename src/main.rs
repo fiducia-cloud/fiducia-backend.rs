@@ -31,8 +31,8 @@ async fn main() {
         .fallback(ServeFile::new(static_dir.join("404.html")));
 
     // Routes are declared as flat literals (not nested) so the shared API-docs
-    // generator (remote/tools/generate-api-docs.mjs, which scans `.route("…")`)
-    // records their true paths.
+    // generator (remote/tools/generate-api-docs.mjs, which scans the router's
+    // route declarations) records their true paths.
     let app = Router::new()
         // Liveness/readiness probe (matches the sibling canonical.cloud
         // convention); also available as /api/health.
@@ -81,8 +81,8 @@ async fn info() -> Json<serde_json::Value> {
 }
 
 // Generated API docs (see AGENTS.md "API Docs Contract"). Artifacts are produced
-// by remote/tools/generate-api-docs.mjs from the `.route("…")` declarations above
-// and committed under generated/; do not hand-edit them.
+// by remote/tools/generate-api-docs.mjs from the route declarations above and
+// committed under generated/; do not hand-edit them.
 async fn api_docs_html() -> axum::response::Html<&'static str> {
     axum::response::Html(include_str!("../generated/api-docs.html"))
 }
