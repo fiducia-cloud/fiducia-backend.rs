@@ -23,11 +23,6 @@ async fn main() {
         .unwrap_or_else(|_| "static".to_string())
         .into();
 
-    // JSON API. Mounted under /api so it takes precedence over the static site.
-    let api = Router::new()
-        .route("/health", get(health))
-        .route("/info", get(info));
-
     // Everything else is served from the static Astro build. Requests for
     // directories resolve to index.html, and unknown paths fall back to the
     // generated 404 page so client routing keeps working.
@@ -35,11 +30,20 @@ async fn main() {
         .append_index_html_on_directories(true)
         .fallback(ServeFile::new(static_dir.join("404.html")));
 
+    // Routes are declared as flat literals (not nested) so the shared API-docs
+    // generator (remote/tools/generate-api-docs.mjs, which scans `.route("…")`)
+    // records their true paths.
     let app = Router::new()
-        // Liveness/readiness probe target (matches the sibling canonical.cloud
-        // deployment convention). Also available as /api/health.
+        // Liveness/readiness probe (matches the sibling canonical.cloud
+        // convention); also available as /api/health.
         .route("/healthz", get(health))
-        .nest("/api", api)
+        .route("/api/health", get(health))
+        .route("/api/info", get(info))
+        // Generated API docs (AGENTS.md "API Docs Contract").
+        .route("/docs/api", get(api_docs_html))
+        .route("/api/docs", get(api_docs_html))
+        .route("/api/docs.json", get(api_docs_json))
+        // Everything else: the static Astro site.
         .fallback_service(serve_dir)
         .layer(TraceLayer::new_for_http());
 
