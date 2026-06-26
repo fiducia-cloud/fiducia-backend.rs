@@ -66,5 +66,12 @@ async fn info() -> Json<serde_json::Value> {
         "service": SERVICE,
         "version": env!("CARGO_PKG_VERSION"),
         "domain": "fiducia.cloud",
+        "role": "website",
+        // The coordination API is not served here — it lives in the data-plane
+        // and control-plane services.
+        "components": {
+            "data_plane": "fiducia-node",
+            "control_plane": "fiducia-brain",
+        },
     }))
 }
