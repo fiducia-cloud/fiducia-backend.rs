@@ -18,31 +18,7 @@ async fn main() {
         .unwrap_or_else(|_| "static".to_string())
         .into();
 
-    // Everything else is served from the static Astro build. Requests for
-    // directories resolve to index.html, and unknown paths fall back to the
-    // generated 404 page so client routing keeps working.
-    let serve_dir = ServeDir::new(&static_dir)
-        .append_index_html_on_directories(true)
-        .fallback(ServeFile::new(static_dir.join("404.html")));
-
-    // Routes are declared as flat literals (not nested) so the shared API-docs
-    // generator (remote/tools/generate-api-docs.mjs, which scans the router's
-    // route declarations) records their true paths.
-    let app = Router::new()
-        // Liveness/readiness probe (matches the sibling canonical.cloud
-        // convention); also available as /api/health.
-        .route("/healthz", get(health))
-        .route("/api/health", get(health))
-        .route("/api/info", get(info))
-        // Generated API docs (AGENTS.md "API Docs Contract").
-        .route("/docs/api", get(api_docs_html))
-        .route("/api/docs", get(api_docs_html))
-        .route("/api/docs.json", get(api_docs_json))
-        // Mermaid architecture diagram (rendered client-side).
-        .route("/docs/diagram", get(diagram_html))
-        // Everything else: the static Astro site.
-        .fallback_service(serve_dir)
-        .layer(TraceLayer::new_for_http());
+    let app = build_router(static_dir.clone());
 
     let port: u16 = std::env::var("PORT")
         .ok()
@@ -56,6 +32,36 @@ async fn main() {
     );
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+/// Build the application router. Separated from `main` so tests can exercise the
+/// routes without binding a socket or initializing telemetry.
+fn build_router(static_dir: PathBuf) -> Router {
+    // Everything else is served from the static Astro build. Requests for
+    // directories resolve to index.html, and unknown paths fall back to the
+    // generated 404 page so client routing keeps working.
+    let serve_dir = ServeDir::new(&static_dir)
+        .append_index_html_on_directories(true)
+        .fallback(ServeFile::new(static_dir.join("404.html")));
+
+    // Routes are declared as flat literals (not nested) so the shared API-docs
+    // generator (remote/tools/generate-api-docs.mjs, which scans the router's
+    // route declarations) records their true paths.
+    Router::new()
+        // Liveness/readiness probe (matches the sibling canonical.cloud
+        // convention); also available as /api/health.
+        .route("/healthz", get(health))
+        .route("/api/health", get(health))
+        .route("/api/info", get(info))
+        // Generated API docs (AGENTS.md "API Docs Contract").
+        .route("/docs/api", get(api_docs_html))
+        .route("/api/docs", get(api_docs_html))
+        .route("/api/docs.json", get(api_docs_json))
+        // Mermaid architecture diagram (rendered client-side).
+        .route("/docs/diagram", get(diagram_html))
+        // Everything else: the static Astro site.
+        .fallback_service(serve_dir)
+        .layer(TraceLayer::new_for_http())
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -94,4 +100,135 @@ async fn api_docs_json() -> impl axum::response::IntoResponse {
 // Mermaid architecture diagram page (rendered client-side via the Mermaid CDN).
 async fn diagram_html() -> axum::response::Html<&'static str> {
     axum::response::Html(include_str!("../docs/diagram.html"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt; // for `oneshot`
+
+    /// Create a throwaway `static/` dir with the minimum files the static
+    /// handler serves (home page, 404 fallback, a hashed asset).
+    fn temp_static_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "fiducia-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(dir.join("_astro")).unwrap();
+        std::fs::write(
+            dir.join("index.html"),
+            "<!doctype html><title>Fiducia</title><h1>home</h1>",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("404.html"),
+            "<!doctype html><title>Not found</title>no quorum on this page",
+        )
+        .unwrap();
+        std::fs::write(dir.join("_astro/app.css"), "body{color:rebeccapurple}").unwrap();
+        dir
+    }
+
+    /// Send a GET through the router and return (status, content-type, body).
+    async fn send(uri: &str) -> (StatusCode, String, String) {
+        let app = build_router(temp_static_dir());
+        let resp = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, ct, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[tokio::test]
+    async fn healthz_and_api_health_report_ok() {
+        for uri in ["/healthz", "/api/health"] {
+            let (status, _ct, body) = send(uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["status"], "ok", "{uri}");
+            assert_eq!(v["service"], "fiducia-backend", "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn api_info_describes_the_website_tier() {
+        let (status, ct, body) = send("/api/info").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ct.contains("application/json"), "ct={ct}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["service"], "fiducia-backend");
+        assert_eq!(v["domain"], "fiducia.cloud");
+        assert_eq!(v["role"], "website");
+        assert_eq!(v["components"]["data_plane"], "fiducia-node");
+        assert_eq!(v["components"]["control_plane"], "fiducia-brain");
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn docs_api_and_alias_serve_html() {
+        for uri in ["/docs/api", "/api/docs"] {
+            let (status, ct, body) = send(uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert!(ct.contains("text/html"), "{uri} ct={ct}");
+            assert!(body.contains("fiducia-backend.rs API docs"), "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn api_docs_json_is_machine_readable() {
+        let (status, ct, body) = send("/api/docs.json").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ct.contains("application/json"), "ct={ct}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["service"], "fiducia-backend.rs");
+        assert!(v["routeCount"].as_u64().unwrap() >= 6);
+        let standard = v["standardDocsRoutes"].as_array().unwrap();
+        for r in ["/docs/api", "/api/docs", "/api/docs.json"] {
+            assert!(standard.iter().any(|x| x == r), "missing {r} in standardDocsRoutes");
+        }
+    }
+
+    #[tokio::test]
+    async fn diagram_route_serves_html() {
+        let (status, ct, _body) = send("/docs/diagram").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ct.contains("text/html"), "ct={ct}");
+    }
+
+    #[tokio::test]
+    async fn root_serves_the_static_index() {
+        let (status, ct, body) = send("/").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ct.contains("text/html"), "ct={ct}");
+        assert!(body.contains("home"));
+    }
+
+    #[tokio::test]
+    async fn static_asset_served_with_correct_mime() {
+        let (status, ct, body) = send("/_astro/app.css").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ct.contains("text/css"), "ct={ct}");
+        assert!(body.contains("rebeccapurple"));
+    }
+
+    #[tokio::test]
+    async fn unknown_path_falls_back_to_the_404_page() {
+        // SPA-style fallback: the styled 404 page is served (ServeFile returns 200).
+        let (status, _ct, body) = send("/does/not/exist").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("no quorum on this page"));
+    }
 }
