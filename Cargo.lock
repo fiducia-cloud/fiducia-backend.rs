@@ -228,6 +228,7 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "axum",
+ "fiducia-interfaces",
  "fiducia-telemetry",
  "maud",
  "serde",
@@ -237,6 +238,14 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "fiducia-interfaces"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
