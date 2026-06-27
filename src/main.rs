@@ -1,12 +1,15 @@
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{routing::get, Json, Router};
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 use serde_json::json;
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::{ServeDir, ServeFile};
@@ -20,6 +23,9 @@ const SERVICE: &str = "fiducia-backend";
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Cap request bodies — this tier only serves GETs.
 const MAX_BODY_BYTES: usize = 64 * 1024;
+const STREAM_HEARTBEAT_SECS: u64 = 15;
+const CUSTOMER_WS_PATH: &str = "/app/ws";
+const CUSTOMER_EVENTS_PATH: &str = "/app/events";
 
 const CUSTOMER_REGIONS: &[&str] = &["auto", "iad1", "sfo1", "ams1", "fra1", "sin1", "syd1"];
 
@@ -97,6 +103,8 @@ fn build_router(config: AppConfig) -> Router {
         .route("/app/requests", get(customer_requests))
         .route("/app/kv", get(customer_kv))
         .route("/app/services", get(customer_services))
+        .route(CUSTOMER_WS_PATH, get(customer_ws))
+        .route(CUSTOMER_EVENTS_PATH, get(customer_events))
         .route("/app/fragments/summary", get(summary_fragment))
         .route("/app/fragments/locks", get(locks_fragment))
         .route("/app/fragments/requests", get(requests_fragment))
@@ -167,6 +175,11 @@ async fn info(State(config): State<AppConfig>) -> Json<serde_json::Value> {
             "host": config.customer_app_host,
             "path": "/app",
             "static_prefix": "/_customer",
+            "streams": {
+                "websocket": CUSTOMER_WS_PATH,
+                "sse": CUSTOMER_EVENTS_PATH,
+                "heartbeat_secs": STREAM_HEARTBEAT_SECS,
+            },
             "regions": CUSTOMER_REGIONS,
             "supabase_realtime": config.supabase_url.is_some()
                 && config.supabase_anon_key.is_some(),
@@ -229,6 +242,99 @@ async fn kv_fragment() -> Markup {
 
 async fn services_fragment() -> Markup {
     services_markup()
+}
+
+async fn customer_ws(ws: WebSocketUpgrade) -> Response {
+    ws.on_upgrade(customer_ws_stream)
+}
+
+async fn customer_events() -> impl IntoResponse {
+    let stream = async_stream::stream! {
+        yield Ok::<Event, Infallible>(stream_event("connected", 0));
+
+        let mut interval = tokio::time::interval(Duration::from_secs(STREAM_HEARTBEAT_SECS));
+        let mut sequence = 1_u64;
+        loop {
+            interval.tick().await;
+            yield Ok::<Event, Infallible>(stream_event("refresh", sequence));
+            sequence = sequence.saturating_add(1);
+        }
+    };
+
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(STREAM_HEARTBEAT_SECS))
+            .text("keepalive"),
+    )
+}
+
+async fn customer_ws_stream(mut socket: WebSocket) {
+    let initial = stream_payload("connected", 0, "websocket").to_string();
+    if socket.send(Message::Text(initial)).await.is_err() {
+        return;
+    }
+
+    let mut interval = tokio::time::interval(Duration::from_secs(STREAM_HEARTBEAT_SECS));
+    let mut sequence = 1_u64;
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let payload = stream_payload("refresh", sequence, "websocket").to_string();
+                sequence = sequence.saturating_add(1);
+                if socket.send(Message::Text(payload)).await.is_err() {
+                    return;
+                }
+            }
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) if text.eq_ignore_ascii_case("ping") => {
+                        if socket.send(Message::Text(stream_payload("pong", sequence, "websocket").to_string())).await.is_err() {
+                            return;
+                        }
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => return,
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => return,
+                }
+            }
+        }
+    }
+}
+
+fn stream_event(kind: &str, sequence: u64) -> Event {
+    Event::default()
+        .event("fiducia-refresh")
+        .id(sequence.to_string())
+        .data(stream_payload(kind, sequence, "sse").to_string())
+}
+
+fn stream_payload(kind: &str, sequence: u64, transport: &str) -> serde_json::Value {
+    json!({
+        "kind": kind,
+        "sequence": sequence,
+        "transport": transport,
+        "event": "fiducia:refresh",
+        "at_ms": unix_epoch_ms(),
+        "fragments": {
+            "summary": summary_markup().into_string(),
+            "locks": locks_markup().into_string(),
+            "requests": requests_markup().into_string(),
+            "kv": kv_markup().into_string(),
+            "services": services_markup().into_string(),
+        },
+    })
+}
+
+fn unix_epoch_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 fn should_serve_customer_app(config: &AppConfig, headers: &HeaderMap) -> bool {
@@ -535,6 +641,7 @@ fn customer_page(config: &AppConfig, active: CustomerTab) -> Markup {
                             }
                         }
                         div class="topbar__status" {
+                            span class="status-pill" data-backend-stream-status="" data-status="connecting" { "connecting" }
                             span class="status-pill" data-supabase-status="" data-status="offline" { "offline" }
                             span class="status-pill" { "linearizable reads" }
                         }
@@ -581,11 +688,11 @@ fn customer_page(config: &AppConfig, active: CustomerTab) -> Markup {
                                     a href="/api/info" { "API info" }
                                 }
                             }
-                            section id="summary" hx-get="/app/fragments/summary" hx-trigger="load, every 10s, fiducia:refresh from:body" hx-swap="innerHTML" {
+                            section id="summary" hx-get="/app/fragments/summary" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
                                 (summary_markup())
                             }
                             div class="panel-grid" {
-                                section id="locks-panel" class="panel" hx-get="/app/fragments/locks" hx-trigger="load, every 10s, fiducia:refresh from:body" hx-swap="innerHTML" {
+                                section id="locks-panel" class="panel" hx-get="/app/fragments/locks" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
                                     (locks_markup())
                                 }
                                 section class="panel" aria-labelledby="events-heading" {
@@ -598,13 +705,13 @@ fn customer_page(config: &AppConfig, active: CustomerTab) -> Markup {
                                     }
                                 }
                             }
-                            section id="requests-panel" class="panel" hx-get="/app/fragments/requests" hx-trigger="load, every 10s, fiducia:refresh from:body" hx-swap="innerHTML" {
+                            section id="requests-panel" class="panel" hx-get="/app/fragments/requests" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
                                 (requests_markup())
                             }
-                            section id="kv-panel" class="panel" hx-get="/app/fragments/kv" hx-trigger="load, every 15s, fiducia:refresh from:body" hx-swap="innerHTML" {
+                            section id="kv-panel" class="panel" hx-get="/app/fragments/kv" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
                                 (kv_markup())
                             }
-                            section id="services-panel" class="panel" hx-get="/app/fragments/services" hx-trigger="load, every 15s, fiducia:refresh from:body" hx-swap="innerHTML" {
+                            section id="services-panel" class="panel" hx-get="/app/fragments/services" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
                                 (services_markup())
                             }
                         }
@@ -620,6 +727,8 @@ fn customer_config_script(config: &AppConfig) -> Markup {
     let payload = json!({
         "apiBase": "",
         "customerHost": config.customer_app_host,
+        "backendWsPath": CUSTOMER_WS_PATH,
+        "backendEventsPath": CUSTOMER_EVENTS_PATH,
         "regions": CUSTOMER_REGIONS,
         "supabaseUrl": config.supabase_url,
         "supabaseAnonKey": config.supabase_anon_key,
@@ -946,6 +1055,8 @@ mod tests {
         assert_eq!(v["customer_portal"]["host"], "app.fiducia.cloud");
         assert_eq!(v["customer_portal"]["path"], "/app");
         assert_eq!(v["customer_portal"]["static_prefix"], "/_customer");
+        assert_eq!(v["customer_portal"]["streams"]["websocket"], "/app/ws");
+        assert_eq!(v["customer_portal"]["streams"]["sse"], "/app/events");
         assert_eq!(v["customer_portal"]["supabase_realtime"], false);
         assert_eq!(v["components"]["data_plane"], "fiducia-node");
         assert_eq!(v["components"]["control_plane"], "fiducia-brain");
@@ -1001,6 +1112,7 @@ mod tests {
         assert!(ct.contains("text/html"), "ct={ct}");
         assert!(body.contains("Fiducia Customer Portal"));
         assert!(body.contains("/_customer/assets/customer.js"));
+        assert!(body.contains("\"backendWsPath\":\"/app/ws\""));
     }
 
     #[tokio::test]
@@ -1019,6 +1131,42 @@ mod tests {
         assert!(ct.contains("text/html"), "ct={ct}");
         assert!(body.contains("Fence"));
         assert!(body.contains("checkout:tenant-42"));
+    }
+
+    #[tokio::test]
+    async fn customer_sse_stream_is_available() {
+        let app = build_router(test_config());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/app/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.contains("text/event-stream"), "ct={ct}");
+    }
+
+    #[tokio::test]
+    async fn customer_websocket_route_requires_upgrade() {
+        let app = build_router(test_config());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/app/ws")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

@@ -3,10 +3,10 @@
   "generatedBy": "remote/tools/generate-api-docs.mjs",
   "service": "fiducia-backend.rs",
   "language": "rust",
-  "routeCount": 19,
+  "routeCount": 21,
   "routeTypeCounts": {
     "service": 4,
-    "user-generated": 15
+    "user-generated": 17
   },
   "standardDocsRoutes": [
     "/docs/api",
@@ -127,6 +127,23 @@
       "purpose": "Customer portal overview shell rendered by Axum and Maud.",
       "handlers": [
         "customer_home"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-backend.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/app/events",
+      "methods": [
+        "GET"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Customer portal SSE fallback stream with rendered dashboard fragments.",
+      "handlers": [
+        "customer_events"
       ],
       "sourceFiles": [
         "remote/deployments/fiducia-backend.rs/src/main.rs"
@@ -280,6 +297,23 @@
       "purpose": "Customer portal service discovery view.",
       "handlers": [
         "customer_services"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-backend.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/app/ws",
+      "methods": [
+        "GET"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Customer portal WebSocket stream with rendered dashboard fragments.",
+      "handlers": [
+        "customer_ws"
       ],
       "sourceFiles": [
         "remote/deployments/fiducia-backend.rs/src/main.rs"

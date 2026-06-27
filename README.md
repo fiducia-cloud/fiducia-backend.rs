@@ -28,6 +28,8 @@ It serves two things:
 | `/healthz`, `/api/health` | health probe                                          |
 | `/api/info` | service / version JSON                                              |
 | `/app`, `/app/*` | customer portal rendered by axum + Maud and refreshed by HTMX |
+| `/app/ws` | customer portal WebSocket stream for rendered dashboard fragments    |
+| `/app/events` | SSE fallback stream for rendered dashboard fragments             |
 | `/_customer/*` | customer portal Vite assets (`CUSTOMER_STATIC_DIR`)             |
 | everything else | the static [Astro](https://astro.build) site (`STATIC_DIR`)     |
 
@@ -58,6 +60,11 @@ arrive — the Astro build carries the `/fiducia` base so asset URLs round-trip)
 `CUSTOMER_STATIC_DIR` defaults to `customer-static`. If `SUPABASE_URL` and
 `SUPABASE_ANON_KEY` are set, the rendered portal passes them to the browser for
 Supabase realtime subscriptions.
+
+The customer browser keeps one Supabase realtime WebSocket and one backend
+stream. The backend stream prefers `/app/ws` and falls back to `/app/events`;
+both send rendered HTML fragments for the dashboard panels so normal stream
+updates do not need a new HTMX HTTP request per fragment.
 
 ## Deployment
 
