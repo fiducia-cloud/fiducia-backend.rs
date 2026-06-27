@@ -90,3 +90,8 @@ async fn api_docs_json() -> impl axum::response::IntoResponse {
         include_str!("../generated/api-docs.json"),
     )
 }
+
+// Mermaid architecture diagram page (rendered client-side via the Mermaid CDN).
+async fn diagram_html() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("../docs/diagram.html"))
+}
