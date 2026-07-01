@@ -274,9 +274,10 @@ async fn create_customer_api_key(
     } else {
         "fid_test"
     };
-    let suffix = format!("{:x}", issued_at_ms % 0xffff_ffff);
-    let prefix = format!("{environment_prefix}_{}", &suffix[..suffix.len().min(8)]);
-    let secret = format!("{prefix}_{}", issued_at_ms);
+    // The prefix is a public identifier (safe to derive); the secret must not
+    // be — it is CSPRNG bytes, unguessable from the creation time.
+    let prefix = format!("{environment_prefix}_{}", &random_token_hex(4)[..8]);
+    let secret = format!("{prefix}_{}", random_token_hex(24));
 
     (
         StatusCode::CREATED,
