@@ -593,6 +593,23 @@ fn unix_epoch_ms() -> u128 {
         .as_millis()
 }
 
+/// Hex-encoded CSPRNG token for demo secrets. The customer portal is a mock
+/// (no key is persisted), but it must still model correct behaviour: a secret
+/// is never derived from a timestamp — it comes from the OS CSPRNG, so it can't
+/// be guessed from roughly-known creation time. Mirrors fiducia-auth, which is
+/// the real issuer.
+fn random_token_hex(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
+    // getrandom only fails if the OS entropy source is unavailable; treat that
+    // as fatal for a secret rather than falling back to a weak value.
+    getrandom::getrandom(&mut buf).expect("OS CSPRNG unavailable");
+    let mut out = String::with_capacity(bytes * 2);
+    for b in buf {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
 fn should_serve_customer_app(config: &AppConfig, headers: &HeaderMap) -> bool {
     if config.customer_site_mode {
         return true;
