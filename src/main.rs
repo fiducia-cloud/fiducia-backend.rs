@@ -268,7 +268,6 @@ async fn create_customer_api_key(
         );
     }
 
-    let issued_at_ms = unix_epoch_ms();
     let environment_prefix = if payload.environment == "live" {
         "fid_live"
     } else {
