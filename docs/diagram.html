@@ -135,6 +135,26 @@ flowchart LR
 
     <h2>6 · Security posture</h2>
     <p class="note">Edge terminates auth + rate limit; API-key secrets are CSPRNG-generated and stored only as SHA-256; the admin dev-session bypass is debug-only; every data/control-plane pod runs non-root, read-only-rootfs, dropping all Linux capabilities. Internal planes (introspect, node peer RPC) are cluster-internal and should be mTLS.</p>
+
+    <h2>6 · Use case — coordinating an AI agent fleet</h2>
+    <p class="note">The same primitives map directly onto multi-agent systems: a <b>lock</b> gives exactly-once task ownership, a <b>rate limiter</b> shares one model/tool/spend budget across every agent, and a <b>KV blackboard</b> with watches is the consistent shared memory agents hand work off through. Nothing agent-specific is added — it is the coordination layer a fleet of autonomous workers otherwise reinvents (badly).</p>
+    <div class="diagram"><pre class="mermaid">
+sequenceDiagram
+  participant O as Orchestrator agent
+  participant F as Fiducia
+  participant A1 as Worker agent A
+  participant A2 as Worker agent B
+  O->>F: election/campaign "planner" (TTL lease)
+  Note over O,F: exactly one planner survives crashes/forks
+  A1->>F: lock/acquire task:42 (fencing token, TTL)
+  A2->>F: lock/acquire task:42
+  F-->>A2: denied — held by A1
+  A1->>F: ratelimit/take llm:tenant-7 (fleet-wide budget)
+  F-->>A1: allowed (bucket decremented once, globally)
+  A1->>F: kv/put result:42 (CAS) + watchers notified
+  F-->>A2: watch event → result:42 ready (hand-off)
+  A1->>F: lock/release task:42 (or lease expires on crash)
+    </pre></div>
   </main>
 
   <footer>

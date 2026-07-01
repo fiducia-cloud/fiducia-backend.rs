@@ -268,15 +268,15 @@ async fn create_customer_api_key(
         );
     }
 
-    let issued_at_ms = unix_epoch_ms();
     let environment_prefix = if payload.environment == "live" {
         "fid_live"
     } else {
         "fid_test"
     };
-    let suffix = format!("{:x}", issued_at_ms % 0xffff_ffff);
-    let prefix = format!("{environment_prefix}_{}", &suffix[..suffix.len().min(8)]);
-    let secret = format!("{prefix}_{}", issued_at_ms);
+    // The prefix is a public identifier (safe to derive); the secret must not
+    // be — it is CSPRNG bytes, unguessable from the creation time.
+    let prefix = format!("{environment_prefix}_{}", &random_token_hex(4)[..8]);
+    let secret = format!("{prefix}_{}", random_token_hex(24));
 
     (
         StatusCode::CREATED,
@@ -315,7 +315,7 @@ async fn rotate_customer_api_key(
             "ok": true,
             "prefix": prefix,
             "rotated_at_ms": issued_at_ms,
-            "replacement_secret": format!("{prefix}_rotated_{issued_at_ms}"),
+            "replacement_secret": format!("{prefix}_{}", random_token_hex(24)),
             "overlap_seconds": 900,
         })),
     )
@@ -591,6 +591,23 @@ fn unix_epoch_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+/// Hex-encoded CSPRNG token for demo secrets. The customer portal is a mock
+/// (no key is persisted), but it must still model correct behaviour: a secret
+/// is never derived from a timestamp — it comes from the OS CSPRNG, so it can't
+/// be guessed from roughly-known creation time. Mirrors fiducia-auth, which is
+/// the real issuer.
+fn random_token_hex(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
+    // getrandom only fails if the OS entropy source is unavailable; treat that
+    // as fatal for a secret rather than falling back to a weak value.
+    getrandom::getrandom(&mut buf).expect("OS CSPRNG unavailable");
+    let mut out = String::with_capacity(bytes * 2);
+    for b in buf {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }
 
 fn should_serve_customer_app(config: &AppConfig, headers: &HeaderMap) -> bool {
