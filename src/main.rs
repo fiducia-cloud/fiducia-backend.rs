@@ -48,6 +48,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let customer_static_dir: PathBuf = std::env::var("CUSTOMER_STATIC_DIR")
         .unwrap_or_else(|_| "customer-static".to_string())
         .into();
+
+    // The api_keys vertical is DB-backed when DATABASE_URL points at the customer
+    // Postgres plane. If it is unset (or the DB is unreachable) we fall back to the
+    // in-memory mock path so the portal — and the E2E suite — still boot with no DB.
+    let pool = connect_customer_db().await;
+
+    // One process-wide broadcast channel fans server-pushed frames out to every
+    // connected WS/SSE client: the existing `fiducia:refresh` fragment frames AND
+    // the new `fiducia:sync` change frames emitted on api_keys mutations.
+    let (stream_tx, _) = broadcast::channel::<String>(256);
+
     let config = AppConfig {
         static_dir: static_dir.clone(),
         customer_static_dir: customer_static_dir.clone(),
@@ -60,6 +71,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         supabase_anon_key: std::env::var("SUPABASE_ANON_KEY")
             .ok()
             .filter(|v| !v.is_empty()),
+        pool,
+        stream_tx,
     };
 
     let app = build_router(config);
