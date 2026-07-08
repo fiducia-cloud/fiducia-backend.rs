@@ -41,7 +41,9 @@ jobs:
         continue-on-error: true
       - name: test
         working-directory: repo
-        run: cargo test --lib --bins
+        # Bin-only crate (no lib.rs): `--lib` would error with "no library targets
+        # found", so run the in-binary unit tests with `--bins` (the gating step).
+        run: cargo test --bins
       - name: audit
         working-directory: repo
         run: |
