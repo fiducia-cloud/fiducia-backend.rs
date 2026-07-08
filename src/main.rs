@@ -93,6 +93,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Open a pool to the customer Postgres plane when `DATABASE_URL` is set. Returns
+/// `None` (mock path) if the var is unset/empty, or if the connection fails — the
+/// portal must boot without a DB, so a bad/missing DB is degraded, never fatal.
+async fn connect_customer_db() -> Option<PgPool> {
+    let url = std::env::var("DATABASE_URL").ok().filter(|v| !v.is_empty())?;
+    match sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&url)
+        .await
+    {
+        Ok(pool) => {
+            tracing::info!("customer DB connected — api_keys served from Postgres");
+            Some(pool)
+        }
+        Err(err) => {
+            tracing::error!("customer DB connect failed ({err}); falling back to mock api_keys");
+            None
+        }
+    }
+}
+
 /// Build the application router. Separated from `main` so tests can exercise the
 /// routes without binding a socket or initializing telemetry.
 fn build_router(config: AppConfig) -> Router {
