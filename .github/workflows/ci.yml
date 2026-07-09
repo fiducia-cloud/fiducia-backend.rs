@@ -15,13 +15,13 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: repo
       # The crate depends on sibling path crates under fiducia-interfaces
       # (../fiducia-interfaces/generated/rust and .../generated/rust-db), so the
       # interfaces repo must sit alongside for cargo to resolve them.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: fiducia-cloud/fiducia-interfaces
           path: fiducia-interfaces
