@@ -523,75 +523,58 @@ async fn sync_write_api_keys_row(config: &AppConfig, req: &SyncWriteRequest) -> 
     let id = Uuid::parse_str(&req.id).ok()?;
     let op = req.op.as_deref().unwrap_or("upsert");
 
-    let committed = {
-        {
-            let committed = if op == "delete" {
-                // A delete on a revocable credential is a soft revoke, not a row
-                // drop, so audit/history stay intact. Version still bumps.
-                sqlx::query_as::<_, ApiKeysRow>(
-                    "update api_keys set revoked = true where id = $1 returning *",
-                )
-                .bind(id)
-                .fetch_optional(pool)
-                .await
-            } else {
-                let payload = req.payload.clone().unwrap_or_else(|| json!({}));
-                let name = payload.get("name").and_then(|v| v.as_str());
-                let scopes = payload_scopes(&payload);
-                let env = payload
-                    .get("environment")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| payload.get("env").and_then(|v| v.as_str()));
-                let revoked = match payload.get("status").and_then(|v| v.as_str()) {
-                    Some("revoked") => Some(true),
-                    Some(_) => Some(false),
-                    None => payload.get("revoked").and_then(|v| v.as_bool()),
-                };
-                // COALESCE keeps existing values for any field the client omitted;
-                // the trigger bumps version + updated_at on the UPDATE.
-                sqlx::query_as::<_, ApiKeysRow>(
-                    "update api_keys set \
-                        name = coalesce($2, name), \
-                        scopes = coalesce($3, scopes), \
-                        env = coalesce($4, env), \
-                        revoked = coalesce($5, revoked) \
-                     where id = $1 returning *",
-                )
-                .bind(id)
-                .bind(name)
-                .bind(scopes)
-                .bind(env)
-                .bind(revoked)
-                .fetch_optional(pool)
-                .await
-            };
+    let committed = if op == "delete" {
+        // A delete on a revocable credential is a soft revoke, not a row drop, so
+        // audit/history stay intact. Version still bumps.
+        sqlx::query_as::<_, ApiKeysRow>(
+            "update api_keys set revoked = true where id = $1 returning *",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+    } else {
+        let payload = req.payload.clone().unwrap_or_else(|| json!({}));
+        let name = payload.get("name").and_then(|v| v.as_str());
+        let scopes = payload_scopes(&payload);
+        let env = payload
+            .get("environment")
+            .and_then(|v| v.as_str())
+            .or_else(|| payload.get("env").and_then(|v| v.as_str()));
+        let revoked = match payload.get("status").and_then(|v| v.as_str()) {
+            Some("revoked") => Some(true),
+            Some(_) => Some(false),
+            None => payload.get("revoked").and_then(|v| v.as_bool()),
+        };
+        // COALESCE keeps existing values for any field the client omitted; the
+        // trigger bumps version + updated_at on the UPDATE.
+        sqlx::query_as::<_, ApiKeysRow>(
+            "update api_keys set \
+                name = coalesce($2, name), \
+                scopes = coalesce($3, scopes), \
+                env = coalesce($4, env), \
+                revoked = coalesce($5, revoked) \
+             where id = $1 returning *",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(scopes)
+        .bind(env)
+        .bind(revoked)
+        .fetch_optional(pool)
+        .await
+    };
 
-            match committed {
-                Ok(Some(row)) => {
-                    broadcast_api_key_change(&config, &row);
-                    return (
-                        StatusCode::OK,
-                        Json(json!({
-                            "id": row.id.to_string(),
-                            "committed_version": row.version,
-                        })),
-                    );
-                }
-                Ok(None) => {}
-                Err(err) => tracing::error!("api_keys sync write failed: {err}"),
-            }
+    match committed {
+        Ok(Some(row)) => {
+            broadcast_api_key_change(config, &row);
+            Some(row.version)
+        }
+        Ok(None) => None,
+        Err(err) => {
+            tracing::error!("api_keys sync write failed: {err}");
+            None
         }
     }
-
-    // Fallback ack (no pool, unparseable id, or no matching row): return a
-    // monotonic version so the client's queue drains cleanly instead of retrying.
-    (
-        StatusCode::OK,
-        Json(json!({
-            "id": req.id,
-            "committed_version": req.base_version.unwrap_or(0) + 1,
-        })),
-    )
 }
 
 /// SHA-256 of an API-key secret. Only the hash is ever persisted — the plaintext
