@@ -239,7 +239,15 @@ struct AppConfig {
     pool: Option<PgPool>,
     /// Fans `fiducia:refresh` + `fiducia:sync` frames out to WS/SSE subscribers.
     stream_tx: broadcast::Sender<String>,
+    /// Idempotency-Key → committed_version, so a retried sync write replays its
+    /// original ack instead of re-running the UPDATE (which would re-bump version).
+    /// In-process + bounded — retries happen within a connection's lifetime.
+    idempotency: Arc<Mutex<HashMap<String, i64>>>,
 }
+
+/// Cap on the in-process idempotency cache; cleared wholesale past this (retries
+/// are short-lived, so a coarse bound is fine and avoids unbounded growth).
+const IDEMPOTENCY_CACHE_CAP: usize = 10_000;
 
 async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok", "service": SERVICE }))
