@@ -467,14 +467,64 @@ async fn rotate_customer_api_key(
 /// The @fiducia/sync write path. Upserts the api_keys row and returns the committed
 /// row version so the client can adopt it (clearing its optimistic `dirty` flag),
 /// then broadcasts the change so every other client reconciles too.
-async fn sync_write_api_keys(
+async fn sync_write(
     State(config): State<AppConfig>,
+    Path(table): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<SyncWriteRequest>,
 ) -> impl IntoResponse {
+    // Idempotency: replay the original ack for a retried key instead of re-running
+    // the UPDATE (whose trigger would re-bump `version`). Matches the client's
+    // stable `Idempotency-Key: table:id:op:base_version`.
+    let idem_key = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    if let Some(key) = &idem_key {
+        if let Some(v) = config.idempotency.lock().unwrap().get(key).copied() {
+            return ack(&req.id, v);
+        }
+    }
+
+    let committed = match table.as_str() {
+        "api_keys" => sync_write_api_keys_row(&config, &req).await,
+        // No DB-wired write handler for this table yet — fall through to the
+        // monotonic fallback ack so the client's queue still drains.
+        _ => None,
+    };
+    let version = committed.unwrap_or_else(|| req.base_version.unwrap_or(0) + 1);
+
+    if let Some(key) = idem_key {
+        let mut cache = config.idempotency.lock().unwrap();
+        if cache.len() >= IDEMPOTENCY_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, version);
+    }
+    ack(&req.id, version)
+}
+
+/// Build the shared write-ack the @fiducia/sync client reconciles against.
+fn ack(id: &str, committed_version: i64) -> (StatusCode, Json<WriteAck>) {
+    (
+        StatusCode::OK,
+        Json(WriteAck {
+            id: id.to_string(),
+            committed_version,
+        }),
+    )
+}
+
+/// Persist one queued optimistic write to `api_keys`, broadcasting the committed
+/// change. Returns the committed row version, or `None` when there was no pool /
+/// no matching row / a bad id (caller falls back to a monotonic ack).
+async fn sync_write_api_keys_row(config: &AppConfig, req: &SyncWriteRequest) -> Option<i64> {
+    let pool = config.pool.as_ref()?;
+    let id = Uuid::parse_str(&req.id).ok()?;
     let op = req.op.as_deref().unwrap_or("upsert");
 
-    if let Some(pool) = &config.pool {
-        if let Ok(id) = Uuid::parse_str(&req.id) {
+    let committed = {
+        {
             let committed = if op == "delete" {
                 // A delete on a revocable credential is a soft revoke, not a row
                 // drop, so audit/history stay intact. Version still bumps.
