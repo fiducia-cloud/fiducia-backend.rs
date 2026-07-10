@@ -76,6 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter(|v| !v.is_empty()),
         pool,
         stream_tx,
+        idempotency: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let app = build_router(config);
