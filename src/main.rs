@@ -148,11 +148,12 @@ fn build_router(config: AppConfig) -> Router {
             axum::routing::post(rotate_customer_api_key),
         )
         // Local-first sync write path: the @fiducia/sync client POSTs queued
-        // optimistic writes here; we persist via SQLx and return the committed row
-        // version so the client can adopt it and clear `dirty`.
+        // optimistic writes to /api/customer/sync/{table}; we persist via SQLx and
+        // return the committed row version so the client can adopt it and clear
+        // `dirty`. Generic in the table (only api_keys is DB-wired today).
         .route(
-            "/api/customer/sync/api_keys",
-            axum::routing::post(sync_write_api_keys),
+            "/api/customer/sync/:table",
+            axum::routing::post(sync_write),
         )
         .route(
             "/api/customer/preferences",
