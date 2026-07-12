@@ -13,6 +13,24 @@ use fiducia_interfaces_db::customer::ApiKeysRow;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::entity::api_keys::{ActiveModel, Column, Entity as ApiKeys, Model};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    QueryOrder, SqlxPostgresConnector,
+};
+
+/// Wrap the shared sqlx pool as a SeaORM connection. The api_keys access below is
+/// expressed through the ORM; the pool (and its lifecycle) stays owned by the app.
+fn orm(pool: &PgPool) -> DatabaseConnection {
+    SqlxPostgresConnector::from_sqlx_postgres_pool(pool.clone())
+}
+
+/// The seam's error type is stable across engines: ORM errors are surfaced as an
+/// opaque `sqlx::Error` so handlers/tests need no changes when the engine swaps.
+fn map_err(e: sea_orm::DbErr) -> sqlx::Error {
+    sqlx::Error::Protocol(e.to_string())
+}
+
 /// Fields for a new api_keys row. The secret is never stored — only its hash.
 pub struct NewApiKey<'a> {
     pub key_id: &'a str,
