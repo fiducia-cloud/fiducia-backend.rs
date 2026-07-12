@@ -656,31 +656,6 @@ fn hash_secret(secret: &str) -> String {
     format!("sha256:{digest:x}")
 }
 
-/// Insert a new api_keys row (org-scoped to the first org) and return it with the
-/// server-assigned `id` + `version`.
-async fn insert_api_key(
-    pool: &PgPool,
-    payload: &CreateCustomerApiKeyRequest,
-    prefix: &str,
-    secret: &str,
-    org_id: Uuid,
-) -> Result<ApiKeysRow, sqlx::Error> {
-    // org_id is the caller's verified org (from their Supabase session), never a
-    // server-chosen "first org". The FK on api_keys.org_id rejects a forged org.
-    sqlx::query_as::<_, ApiKeysRow>(
-        "insert into api_keys (key_id, org_id, name, secret_hash, scopes, env) \
-         values ($1, $2, $3, $4, $5, $6) returning *",
-    )
-    .bind(prefix)
-    .bind(org_id)
-    .bind(payload.name.trim())
-    .bind(hash_secret(secret))
-    .bind(json!([payload.scope]))
-    .bind(&payload.environment)
-    .fetch_one(pool)
-    .await
-}
-
 /// Normalize a client `scopes` field to a jsonb array, or `None` to leave it
 /// untouched. The display row stores scopes as a comma string; the column is an
 /// array — accept either shape.
