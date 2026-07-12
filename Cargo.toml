@@ -1,3 +1,5 @@
+# Crate manifest for fiducia-backend — the website-tier axum service. Pins the
+# shared fiducia-* contract/telemetry/sync crates the whole platform speaks.
 [package]
 name = "fiducia-backend"
 version = "0.1.0"
