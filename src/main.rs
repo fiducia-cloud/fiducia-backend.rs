@@ -1,5 +1,13 @@
+// fiducia-backend entrypoint: the axum app for fiducia.cloud's website tier.
+// Serves the static Astro marketing site, the Maud/HTMX customer portal and its
+// WS/SSE fragment streams, plus the DB-backed api_keys + @fiducia/sync endpoints.
+mod auth;
+mod entity;
+mod store;
+
+use auth::{Authenticator, CustomerCtx};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
@@ -77,6 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pool,
         stream_tx,
         idempotency: Arc::new(Mutex::new(HashMap::new())),
+        authenticator: Authenticator::from_env(),
     };
 
     let app = build_router(config);
@@ -153,7 +162,7 @@ fn build_router(config: AppConfig) -> Router {
         // `dirty`. Generic in the table (only api_keys is DB-wired today).
         .route(
             "/api/customer/sync/:table",
-            axum::routing::post(sync_write),
+            axum::routing::post(sync_write).get(sync_catchup),
         )
         .route(
             "/api/customer/preferences",
@@ -245,6 +254,9 @@ struct AppConfig {
     /// original ack instead of re-running the UPDATE (which would re-bump version).
     /// In-process + bounded — retries happen within a connection's lifetime.
     idempotency: Arc<Mutex<HashMap<String, i64>>>,
+    /// Verifies the customer's Supabase session for `/api/customer/*` and scopes
+    /// writes to their org. Fail-closed (`Deny`) when no auth backend is set.
+    authenticator: Authenticator,
 }
 
 /// Cap on the in-process idempotency cache; cleared wholesale past this (retries
@@ -329,16 +341,16 @@ struct CustomerPreferences {
     notify_mfa: bool,
 }
 
-async fn customer_api_keys_json(State(config): State<AppConfig>) -> Json<serde_json::Value> {
+async fn customer_api_keys_json(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
+    let ctx = match config.authenticator.authenticate(&headers).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
     // DB-backed when a pool is present; otherwise the in-memory mock keys. A query
     // failure degrades to the mock so a rendered table never disappears on a blip.
+    // Scoped to the caller's org(s) — a key list must never disclose other tenants.
     let keys = match &config.pool {
-        Some(pool) => match sqlx::query_as::<_, ApiKeysRow>(
-            "select * from api_keys order by created_at asc",
-        )
-        .fetch_all(pool)
-        .await
-        {
+        Some(pool) => match store::list_api_keys(pool, &ctx.org_uuids()).await {
             Ok(rows) => rows.iter().map(api_key_row_to_display).collect::<Vec<_>>(),
             Err(err) => {
                 tracing::error!("api_keys list query failed: {err}");
@@ -354,17 +366,24 @@ async fn customer_api_keys_json(State(config): State<AppConfig>) -> Json<serde_j
         "allowed_environments": ["live", "test"],
         "allowed_scopes": allowed_api_key_scopes(),
     }))
+    .into_response()
 }
 
 async fn create_customer_api_key(
     State(config): State<AppConfig>,
+    headers: HeaderMap,
     Json(payload): Json<CreateCustomerApiKeyRequest>,
-) -> impl IntoResponse {
+) -> Response {
+    let ctx = match config.authenticator.authenticate(&headers).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
     if let Some(error) = validate_api_key_request(&payload) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": error, "ok": false })),
-        );
+        )
+            .into_response();
     }
 
     let environment_prefix = if payload.environment == "live" {
@@ -377,10 +396,25 @@ async fn create_customer_api_key(
     let prefix = format!("{environment_prefix}_{}", &random_token_hex(4)[..8]);
     let secret = format!("{prefix}_{}", random_token_hex(24));
 
-    // DB path: persist the key (storing only the secret hash) and broadcast the
-    // new row as a fiducia:sync change so any connected client folds it in.
+    // DB path: persist the key (storing only the secret hash) under the CALLER's
+    // org (never "first org"), and broadcast the new row as a fiducia:sync change.
     if let Some(pool) = &config.pool {
-        match insert_api_key(pool, &payload, &prefix, &secret).await {
+        let Some(org_id) = ctx.org_uuids().into_iter().next() else {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "ok": false, "error": "no_org_membership" })),
+            )
+                .into_response();
+        };
+        let new_key = store::NewApiKey {
+            key_id: &prefix,
+            org_id,
+            name: payload.name.trim(),
+            secret_hash: hash_secret(&secret),
+            scopes: json!([payload.scope]),
+            env: &payload.environment,
+        };
+        match store::insert_api_key(pool, new_key).await {
             Ok(row) => {
                 broadcast_api_key_change(&config, &row);
                 let mut api_key = api_key_row_to_display(&row);
@@ -394,7 +428,8 @@ async fn create_customer_api_key(
                         "secret": secret,
                         "secret_once": true,
                     })),
-                );
+                )
+                    .into_response();
             }
             Err(err) => tracing::error!("api_key insert failed: {err}"),
         }
@@ -418,36 +453,45 @@ async fn create_customer_api_key(
             "secret_once": true,
         })),
     )
+        .into_response()
 }
 
 async fn rotate_customer_api_key(
     State(config): State<AppConfig>,
+    headers: HeaderMap,
     Json(payload): Json<RotateCustomerApiKeyRequest>,
-) -> impl IntoResponse {
+) -> Response {
+    let ctx = match config.authenticator.authenticate(&headers).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
     let prefix = payload.prefix.trim();
     if prefix.is_empty() || !prefix.starts_with("fid_") {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "invalid_key_prefix", "ok": false })),
-        );
+        )
+            .into_response();
     }
 
     let issued_at_ms = unix_epoch_ms();
     let replacement_secret = format!("{prefix}_{}", random_token_hex(24));
 
-    // DB path: replace the stored secret hash. The bump_row_version trigger
-    // advances `version` + `updated_at`; broadcast the bumped row.
+    // DB path: replace the stored secret hash, scoped to the caller's org so one
+    // tenant can never rotate another tenant's key. The bump_row_version trigger
+    // advances `version` + `updated_at`; broadcast the bumped row. A prefix that
+    // is not the caller's org yields `Ok(None)` (no-op), reported as not-found.
     if let Some(pool) = &config.pool {
-        match sqlx::query_as::<_, ApiKeysRow>(
-            "update api_keys set secret_hash = $1 where key_id = $2 returning *",
-        )
-        .bind(hash_secret(&replacement_secret))
-        .bind(prefix)
-        .fetch_optional(pool)
-        .await
+        match store::rotate_secret(pool, prefix, hash_secret(&replacement_secret), &ctx.org_uuids()).await
         {
             Ok(Some(row)) => broadcast_api_key_change(&config, &row),
-            Ok(None) => {}
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "ok": false, "error": "key_not_found" })),
+                )
+                    .into_response();
+            }
             Err(err) => tracing::error!("api_key rotate failed: {err}"),
         }
     }
@@ -462,6 +506,7 @@ async fn rotate_customer_api_key(
             "overlap_seconds": 900,
         })),
     )
+        .into_response()
 }
 
 /// The @fiducia/sync write path, generic in `{table}` (only `api_keys` is DB-wired
@@ -473,7 +518,13 @@ async fn sync_write(
     Path(table): Path<String>,
     headers: HeaderMap,
     Json(req): Json<SyncWriteRequest>,
-) -> impl IntoResponse {
+) -> Response {
+    // Authenticate before any state read/write: the sync path is a row-mutating
+    // surface and was previously an unauthenticated IDOR into api_keys.
+    let ctx = match config.authenticator.authenticate(&headers).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
     // Idempotency: replay the original ack for a retried key instead of re-running
     // the UPDATE (whose trigger would re-bump `version`). Matches the client's
     // stable `Idempotency-Key: table:id:op:base_version`.
@@ -482,27 +533,113 @@ async fn sync_write(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
     if let Some(key) = &idem_key {
-        if let Some(v) = config.idempotency.lock().unwrap().get(key).copied() {
-            return ack(&req.id, v);
+        match idempotency_begin(&config, key).await {
+            Idem::Replay(v) => return ack(&req.id, v).into_response(),
+            // A concurrent identical request holds the claim; don't re-run the
+            // mutation — return the monotonic fallback so the queue still drains.
+            Idem::InFlight => return ack(&req.id, req.base_version.unwrap_or(0) + 1).into_response(),
+            Idem::Proceed => {}
         }
     }
 
     let committed = match table.as_str() {
-        "api_keys" => sync_write_api_keys_row(&config, &req).await,
+        // Scoped to the caller's org so a client can only mutate its own rows.
+        "api_keys" => sync_write_api_keys_row(&config, &req, &ctx).await,
         // No DB-wired write handler for this table yet — fall through to the
         // monotonic fallback ack so the client's queue still drains.
         _ => None,
     };
     let version = committed.unwrap_or_else(|| req.base_version.unwrap_or(0) + 1);
 
-    if let Some(key) = idem_key {
+    if let Some(key) = &idem_key {
+        idempotency_commit(&config, key, version).await;
+    }
+    ack(&req.id, version).into_response()
+}
+
+/// Idempotency decision for a claimed/seen key.
+enum Idem {
+    /// A previously-committed write — replay this version.
+    Replay(i64),
+    /// A concurrent claim is still in-flight — do not re-run.
+    InFlight,
+    /// We own the key (or there's no durable store) — run the mutation.
+    Proceed,
+}
+
+/// Begin idempotent handling of `key`. Durable (survives restarts) when a pool is
+/// present — claim-first so only the first request runs the mutation; otherwise an
+/// in-process cache (the mock/no-DB path used in tests).
+async fn idempotency_begin(config: &AppConfig, key: &str) -> Idem {
+    if let Some(pool) = &config.pool {
+        match store::idem_claim(pool, key).await {
+            Ok(true) => Idem::Proceed, // we own the claim
+            Ok(false) => match store::idem_committed(pool, key).await {
+                Ok(Some(Some(v))) => Idem::Replay(v),
+                Ok(Some(None)) => Idem::InFlight,
+                _ => Idem::Proceed, // vanished/error — recompute (write is data-idempotent)
+            },
+            Err(_) => Idem::Proceed, // ledger error must not block the write
+        }
+    } else if let Some(v) = config.idempotency.lock().unwrap().get(key).copied() {
+        Idem::Replay(v)
+    } else {
+        Idem::Proceed
+    }
+}
+
+/// Record the committed version for `key` (durable when pooled, else in-process).
+async fn idempotency_commit(config: &AppConfig, key: &str, version: i64) {
+    if let Some(pool) = &config.pool {
+        let _ = store::idem_record(pool, key, version).await;
+    } else {
         let mut cache = config.idempotency.lock().unwrap();
         if cache.len() >= IDEMPOTENCY_CACHE_CAP {
             cache.clear();
         }
-        cache.insert(key, version);
+        cache.insert(key.to_owned(), version);
     }
-    ack(&req.id, version)
+}
+
+#[derive(Debug, Deserialize)]
+struct CatchupParams {
+    /// Return rows with `version` strictly greater than this cursor (default 0).
+    #[serde(default)]
+    since: i64,
+}
+
+/// Catch-up hydration: `GET /api/customer/sync/{table}?since=<version>` returns the
+/// authoritative rows newer than the client's cursor (org-scoped, ordered by
+/// version, index-backed) so anything missed while offline reconciles. Feeds the
+/// SDK's `hydrate()`.
+async fn sync_catchup(
+    State(config): State<AppConfig>,
+    Path(table): Path<String>,
+    headers: HeaderMap,
+    Query(params): Query<CatchupParams>,
+) -> Response {
+    let ctx = match config.authenticator.authenticate(&headers).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let rows: Vec<serde_json::Value> = match (table.as_str(), &config.pool) {
+        ("api_keys", Some(pool)) => {
+            let orgs = ctx.org_uuids();
+            if orgs.is_empty() {
+                vec![]
+            } else {
+                match store::catchup_api_keys(pool, &orgs, params.since, 500).await {
+                    Ok(rows) => rows.iter().map(api_key_row_to_display).collect(),
+                    Err(err) => {
+                        tracing::error!("api_keys catch-up failed: {err}");
+                        vec![]
+                    }
+                }
+            }
+        }
+        _ => vec![],
+    };
+    Json(json!({ "table": table, "since": params.since, "rows": rows })).into_response()
 }
 
 /// Build the shared write-ack the @fiducia/sync client reconciles against.
@@ -519,50 +656,45 @@ fn ack(id: &str, committed_version: i64) -> (StatusCode, Json<WriteAck>) {
 /// Persist one queued optimistic write to `api_keys`, broadcasting the committed
 /// change. Returns the committed row version, or `None` when there was no pool /
 /// no matching row / a bad id (caller falls back to a monotonic ack).
-async fn sync_write_api_keys_row(config: &AppConfig, req: &SyncWriteRequest) -> Option<i64> {
+async fn sync_write_api_keys_row(
+    config: &AppConfig,
+    req: &SyncWriteRequest,
+    ctx: &CustomerCtx,
+) -> Option<i64> {
     let pool = config.pool.as_ref()?;
     let id = Uuid::parse_str(&req.id).ok()?;
     let op = req.op.as_deref().unwrap_or("upsert");
+    // Every mutation is scoped to the caller's org(s); a row in another tenant's
+    // org yields no match (Option::None), so this is not a cross-tenant IDOR.
+    let orgs = ctx.org_uuids();
+    if orgs.is_empty() {
+        return None;
+    }
 
     let committed = if op == "delete" {
         // A delete on a revocable credential is a soft revoke, not a row drop, so
         // audit/history stay intact. Version still bumps.
-        sqlx::query_as::<_, ApiKeysRow>(
-            "update api_keys set revoked = true where id = $1 returning *",
-        )
-        .bind(id)
-        .fetch_optional(pool)
-        .await
+        store::soft_delete(pool, id, &orgs).await
     } else {
         let payload = req.payload.clone().unwrap_or_else(|| json!({}));
-        let name = payload.get("name").and_then(|v| v.as_str());
-        let scopes = payload_scopes(&payload);
-        let env = payload
-            .get("environment")
-            .and_then(|v| v.as_str())
-            .or_else(|| payload.get("env").and_then(|v| v.as_str()));
         let revoked = match payload.get("status").and_then(|v| v.as_str()) {
             Some("revoked") => Some(true),
             Some(_) => Some(false),
             None => payload.get("revoked").and_then(|v| v.as_bool()),
         };
+        let patch = store::ApiKeyPatch {
+            name: payload.get("name").and_then(|v| v.as_str()).map(str::to_owned),
+            scopes: payload_scopes(&payload),
+            env: payload
+                .get("environment")
+                .and_then(|v| v.as_str())
+                .or_else(|| payload.get("env").and_then(|v| v.as_str()))
+                .map(str::to_owned),
+            revoked,
+        };
         // COALESCE keeps existing values for any field the client omitted; the
         // trigger bumps version + updated_at on the UPDATE.
-        sqlx::query_as::<_, ApiKeysRow>(
-            "update api_keys set \
-                name = coalesce($2, name), \
-                scopes = coalesce($3, scopes), \
-                env = coalesce($4, env), \
-                revoked = coalesce($5, revoked) \
-             where id = $1 returning *",
-        )
-        .bind(id)
-        .bind(name)
-        .bind(scopes)
-        .bind(env)
-        .bind(revoked)
-        .fetch_optional(pool)
-        .await
+        store::upsert_fields(pool, id, &orgs, patch).await
     };
 
     match committed {
@@ -584,33 +716,6 @@ fn hash_secret(secret: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(secret.as_bytes());
     format!("sha256:{digest:x}")
-}
-
-/// Insert a new api_keys row (org-scoped to the first org) and return it with the
-/// server-assigned `id` + `version`.
-async fn insert_api_key(
-    pool: &PgPool,
-    payload: &CreateCustomerApiKeyRequest,
-    prefix: &str,
-    secret: &str,
-) -> Result<ApiKeysRow, sqlx::Error> {
-    let org_id: Uuid =
-        sqlx::query_scalar("select id from orgs order by created_at asc limit 1")
-            .fetch_one(pool)
-            .await?;
-
-    sqlx::query_as::<_, ApiKeysRow>(
-        "insert into api_keys (key_id, org_id, name, secret_hash, scopes, env) \
-         values ($1, $2, $3, $4, $5, $6) returning *",
-    )
-    .bind(prefix)
-    .bind(org_id)
-    .bind(payload.name.trim())
-    .bind(hash_secret(secret))
-    .bind(json!([payload.scope]))
-    .bind(&payload.environment)
-    .fetch_one(pool)
-    .await
 }
 
 /// Normalize a client `scopes` field to a jsonb array, or `None` to leave it
@@ -686,19 +791,26 @@ async fn customer_preferences_json() -> Json<CustomerPreferences> {
 }
 
 async fn update_customer_preferences(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
     Json(payload): Json<CustomerPreferences>,
-) -> impl IntoResponse {
+) -> Response {
+    if let Err(e) = config.authenticator.authenticate(&headers).await {
+        return e;
+    }
     if !CUSTOMER_REGIONS.contains(&payload.region.as_str()) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "invalid_region", "ok": false })),
-        );
+        )
+            .into_response();
     }
     if !["comfortable", "compact"].contains(&payload.density.as_str()) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "invalid_density", "ok": false })),
-        );
+        )
+            .into_response();
     }
 
     (
@@ -709,6 +821,7 @@ async fn update_customer_preferences(
             "saved_at_ms": unix_epoch_ms(),
         })),
     )
+        .into_response()
 }
 
 async fn customer_security_sessions_json() -> Json<serde_json::Value> {
@@ -719,14 +832,20 @@ async fn customer_security_sessions_json() -> Json<serde_json::Value> {
 }
 
 async fn revoke_customer_security_session(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
     Json(payload): Json<RevokeCustomerSecuritySessionRequest>,
-) -> impl IntoResponse {
+) -> Response {
+    if let Err(e) = config.authenticator.authenticate(&headers).await {
+        return e;
+    }
     let device = payload.device.trim();
     if device.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "device_required", "ok": false })),
-        );
+        )
+            .into_response();
     }
 
     let found = sessions().iter().any(|row| row.device == device);
@@ -734,7 +853,8 @@ async fn revoke_customer_security_session(
         return (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "session_not_found", "ok": false })),
-        );
+        )
+            .into_response();
     }
 
     (
@@ -746,6 +866,7 @@ async fn revoke_customer_security_session(
             "revoked_at_ms": unix_epoch_ms(),
         })),
     )
+        .into_response()
 }
 
 fn validate_api_key_request(payload: &CreateCustomerApiKeyRequest) -> Option<&'static str> {
@@ -2308,6 +2429,13 @@ mod tests {
             pool: None,
             stream_tx: broadcast::channel(16).0,
             idempotency: Arc::new(Mutex::new(HashMap::new())),
+            // Tests exercise the handlers as an authenticated customer with a
+            // fixed org; production uses `Authenticator::from_env()` (fail-closed).
+            authenticator: Authenticator::Static(Arc::new(CustomerCtx {
+                user_id: "test-user".to_string(),
+                email: Some("test@fiducia.cloud".to_string()),
+                orgs: vec!["00000000-0000-0000-0000-000000000001".to_string()],
+            })),
         }
     }
 
