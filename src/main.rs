@@ -83,6 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pool,
         stream_tx,
         idempotency: Arc::new(Mutex::new(HashMap::new())),
+        authenticator: Authenticator::from_env(),
     };
 
     let app = build_router(config);
