@@ -405,7 +405,15 @@ async fn create_customer_api_key(
             )
                 .into_response();
         };
-        match insert_api_key(pool, &payload, &prefix, &secret, org_id).await {
+        let new_key = store::NewApiKey {
+            key_id: &prefix,
+            org_id,
+            name: payload.name.trim(),
+            secret_hash: hash_secret(&secret),
+            scopes: json!([payload.scope]),
+            env: &payload.environment,
+        };
+        match store::insert_api_key(pool, new_key).await {
             Ok(row) => {
                 broadcast_api_key_change(&config, &row);
                 let mut api_key = api_key_row_to_display(&row);
