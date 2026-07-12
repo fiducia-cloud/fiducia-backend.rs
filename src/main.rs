@@ -339,13 +339,19 @@ struct CustomerPreferences {
     notify_mfa: bool,
 }
 
-async fn customer_api_keys_json(State(config): State<AppConfig>) -> Json<serde_json::Value> {
+async fn customer_api_keys_json(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
+    let ctx = match config.authenticator.authenticate(&headers).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
     // DB-backed when a pool is present; otherwise the in-memory mock keys. A query
     // failure degrades to the mock so a rendered table never disappears on a blip.
+    // Scoped to the caller's org(s) — a key list must never disclose other tenants.
     let keys = match &config.pool {
         Some(pool) => match sqlx::query_as::<_, ApiKeysRow>(
-            "select * from api_keys order by created_at asc",
+            "select * from api_keys where org_id = any($1) order by created_at asc",
         )
+        .bind(ctx.org_uuids())
         .fetch_all(pool)
         .await
         {
@@ -364,6 +370,7 @@ async fn customer_api_keys_json(State(config): State<AppConfig>) -> Json<serde_j
         "allowed_environments": ["live", "test"],
         "allowed_scopes": allowed_api_key_scopes(),
     }))
+    .into_response()
 }
 
 async fn create_customer_api_key(
