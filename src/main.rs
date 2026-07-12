@@ -1,3 +1,6 @@
+// fiducia-backend entrypoint: the axum app for fiducia.cloud's website tier.
+// Serves the static Astro marketing site, the Maud/HTMX customer portal and its
+// WS/SSE fragment streams, plus the DB-backed api_keys + @fiducia/sync endpoints.
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -2580,9 +2583,11 @@ mod tests {
 
     #[tokio::test]
     async fn diagram_route_serves_html() {
-        let (status, ct, _body) = send("/docs/diagram").await;
+        let (status, ct, body) = send("/docs/diagram").await;
         assert_eq!(status, StatusCode::OK);
         assert!(ct.contains("text/html"), "ct={ct}");
+        assert!(body.contains("AI-agent fleets"));
+        assert!(body.contains("durable brain-Raft: target HA step"));
     }
 
     #[tokio::test]
