@@ -792,14 +792,20 @@ async fn customer_security_sessions_json() -> Json<serde_json::Value> {
 }
 
 async fn revoke_customer_security_session(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
     Json(payload): Json<RevokeCustomerSecuritySessionRequest>,
-) -> impl IntoResponse {
+) -> Response {
+    if let Err(e) = config.authenticator.authenticate(&headers).await {
+        return e;
+    }
     let device = payload.device.trim();
     if device.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "device_required", "ok": false })),
-        );
+        )
+            .into_response();
     }
 
     let found = sessions().iter().any(|row| row.device == device);
@@ -807,7 +813,8 @@ async fn revoke_customer_security_session(
         return (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "session_not_found", "ok": false })),
-        );
+        )
+            .into_response();
     }
 
     (
@@ -819,6 +826,7 @@ async fn revoke_customer_security_session(
             "revoked_at_ms": unix_epoch_ms(),
         })),
     )
+        .into_response()
 }
 
 fn validate_api_key_request(payload: &CreateCustomerApiKeyRequest) -> Option<&'static str> {
