@@ -620,13 +620,14 @@ async fn sync_write_api_keys_row(
                 scopes = coalesce($3, scopes), \
                 env = coalesce($4, env), \
                 revoked = coalesce($5, revoked) \
-             where id = $1 returning *",
+             where id = $1 and org_id = any($6) returning *",
         )
         .bind(id)
         .bind(name)
         .bind(scopes)
         .bind(env)
         .bind(revoked)
+        .bind(&orgs)
         .fetch_optional(pool)
         .await
     };
