@@ -481,14 +481,7 @@ async fn rotate_customer_api_key(
     // advances `version` + `updated_at`; broadcast the bumped row. A prefix that
     // is not the caller's org yields `Ok(None)` (no-op), reported as not-found.
     if let Some(pool) = &config.pool {
-        match sqlx::query_as::<_, ApiKeysRow>(
-            "update api_keys set secret_hash = $1 where key_id = $2 and org_id = any($3) returning *",
-        )
-        .bind(hash_secret(&replacement_secret))
-        .bind(prefix)
-        .bind(ctx.org_uuids())
-        .fetch_optional(pool)
-        .await
+        match store::rotate_secret(pool, prefix, hash_secret(&replacement_secret), &ctx.org_uuids()).await
         {
             Ok(Some(row)) => broadcast_api_key_change(&config, &row),
             Ok(None) => {
