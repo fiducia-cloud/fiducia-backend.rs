@@ -574,18 +574,29 @@ fn ack(id: &str, committed_version: i64) -> (StatusCode, Json<WriteAck>) {
 /// Persist one queued optimistic write to `api_keys`, broadcasting the committed
 /// change. Returns the committed row version, or `None` when there was no pool /
 /// no matching row / a bad id (caller falls back to a monotonic ack).
-async fn sync_write_api_keys_row(config: &AppConfig, req: &SyncWriteRequest) -> Option<i64> {
+async fn sync_write_api_keys_row(
+    config: &AppConfig,
+    req: &SyncWriteRequest,
+    ctx: &CustomerCtx,
+) -> Option<i64> {
     let pool = config.pool.as_ref()?;
     let id = Uuid::parse_str(&req.id).ok()?;
     let op = req.op.as_deref().unwrap_or("upsert");
+    // Every mutation is scoped to the caller's org(s); a row in another tenant's
+    // org yields no match (Option::None), so this is not a cross-tenant IDOR.
+    let orgs = ctx.org_uuids();
+    if orgs.is_empty() {
+        return None;
+    }
 
     let committed = if op == "delete" {
         // A delete on a revocable credential is a soft revoke, not a row drop, so
         // audit/history stay intact. Version still bumps.
         sqlx::query_as::<_, ApiKeysRow>(
-            "update api_keys set revoked = true where id = $1 returning *",
+            "update api_keys set revoked = true where id = $1 and org_id = any($2) returning *",
         )
         .bind(id)
+        .bind(&orgs)
         .fetch_optional(pool)
         .await
     } else {
