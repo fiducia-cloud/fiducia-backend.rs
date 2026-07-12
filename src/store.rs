@@ -52,28 +52,45 @@ pub struct ApiKeyPatch {
 
 /// List the caller's api keys (org-scoped), newest first.
 pub async fn list_api_keys(pool: &PgPool, orgs: &[Uuid]) -> Result<Vec<ApiKeysRow>, sqlx::Error> {
-    sqlx::query_as::<_, ApiKeysRow>(
-        "select * from api_keys where org_id = any($1) order by created_at asc",
-    )
-    .bind(orgs)
-    .fetch_all(pool)
-    .await
+    let rows = ApiKeys::find()
+        .filter(Column::OrgId.is_in(orgs.iter().copied()))
+        .order_by_asc(Column::CreatedAt)
+        .all(&orm(pool))
+        .await
+        .map_err(map_err)?;
+    Ok(rows.into_iter().map(Model::into_row).collect())
 }
 
-/// Insert a key under `new.org_id` and return the committed row.
+/// Insert a key under `new.org_id` and return the committed row. The primary key,
+/// version, and timestamps are left unset so the DB defaults/trigger populate them.
 pub async fn insert_api_key(pool: &PgPool, new: NewApiKey<'_>) -> Result<ApiKeysRow, sqlx::Error> {
-    sqlx::query_as::<_, ApiKeysRow>(
-        "insert into api_keys (key_id, org_id, name, secret_hash, scopes, env) \
-         values ($1, $2, $3, $4, $5, $6) returning *",
-    )
-    .bind(new.key_id)
-    .bind(new.org_id)
-    .bind(new.name)
-    .bind(new.secret_hash)
-    .bind(new.scopes)
-    .bind(new.env)
-    .fetch_one(pool)
+    let model = ActiveModel {
+        key_id: Set(new.key_id.to_string()),
+        org_id: Set(new.org_id),
+        name: Set(new.name.to_string()),
+        secret_hash: Set(new.secret_hash),
+        scopes: Set(new.scopes),
+        env: Set(new.env.to_string()),
+        ..Default::default()
+    }
+    .insert(&orm(pool))
     .await
+    .map_err(map_err)?;
+    Ok(model.into_row())
+}
+
+/// Load one key scoped to the caller's org(s) — the org filter is what makes every
+/// mutation below tenant-safe (a row in another org is simply never found).
+async fn find_owned(
+    conn: &DatabaseConnection,
+    filter: sea_orm::Select<ApiKeys>,
+    orgs: &[Uuid],
+) -> Result<Option<Model>, sqlx::Error> {
+    filter
+        .filter(Column::OrgId.is_in(orgs.iter().copied()))
+        .one(conn)
+        .await
+        .map_err(map_err)
 }
 
 /// Rotate the stored secret hash for a key, scoped to the caller's org(s).
@@ -84,14 +101,16 @@ pub async fn rotate_secret(
     secret_hash: String,
     orgs: &[Uuid],
 ) -> Result<Option<ApiKeysRow>, sqlx::Error> {
-    sqlx::query_as::<_, ApiKeysRow>(
-        "update api_keys set secret_hash = $1 where key_id = $2 and org_id = any($3) returning *",
-    )
-    .bind(secret_hash)
-    .bind(key_id)
-    .bind(orgs)
-    .fetch_optional(pool)
-    .await
+    let conn = orm(pool);
+    let Some(model) = find_owned(&conn, ApiKeys::find().filter(Column::KeyId.eq(key_id)), orgs).await?
+    else {
+        return Ok(None);
+    };
+    let mut active: ActiveModel = model.into();
+    active.secret_hash = Set(secret_hash);
+    // Only secret_hash is dirty; the BEFORE UPDATE trigger bumps version + updated_at.
+    let updated = active.update(&conn).await.map_err(map_err)?;
+    Ok(Some(updated.into_row()))
 }
 
 /// Soft-revoke a key by id, scoped to the caller's org(s).
@@ -100,38 +119,53 @@ pub async fn soft_delete(
     id: Uuid,
     orgs: &[Uuid],
 ) -> Result<Option<ApiKeysRow>, sqlx::Error> {
-    sqlx::query_as::<_, ApiKeysRow>(
-        "update api_keys set revoked = true where id = $1 and org_id = any($2) returning *",
-    )
-    .bind(id)
-    .bind(orgs)
-    .fetch_optional(pool)
-    .await
+    let conn = orm(pool);
+    let Some(model) = find_owned(&conn, ApiKeys::find_by_id(id), orgs).await? else {
+        return Ok(None);
+    };
+    let mut active: ActiveModel = model.into();
+    active.revoked = Set(true);
+    let updated = active.update(&conn).await.map_err(map_err)?;
+    Ok(Some(updated.into_row()))
 }
 
-/// Apply a sync upsert patch to a key by id, scoped to the caller's org(s).
+/// Apply a sync upsert patch to a key by id, scoped to the caller's org(s). Only
+/// the fields present in the patch are written (the COALESCE-equivalent); the
+/// trigger bumps version on any write.
 pub async fn upsert_fields(
     pool: &PgPool,
     id: Uuid,
     orgs: &[Uuid],
     patch: ApiKeyPatch,
 ) -> Result<Option<ApiKeysRow>, sqlx::Error> {
-    sqlx::query_as::<_, ApiKeysRow>(
-        "update api_keys set \
-            name = coalesce($2, name), \
-            scopes = coalesce($3, scopes), \
-            env = coalesce($4, env), \
-            revoked = coalesce($5, revoked) \
-         where id = $1 and org_id = any($6) returning *",
-    )
-    .bind(id)
-    .bind(patch.name)
-    .bind(patch.scopes)
-    .bind(patch.env)
-    .bind(patch.revoked)
-    .bind(orgs)
-    .fetch_optional(pool)
-    .await
+    let conn = orm(pool);
+    let Some(model) = find_owned(&conn, ApiKeys::find_by_id(id), orgs).await? else {
+        return Ok(None);
+    };
+    // An empty patch is a no-op (SeaORM would reject an update with no dirty
+    // columns); return the current row unchanged rather than error.
+    if patch.name.is_none()
+        && patch.scopes.is_none()
+        && patch.env.is_none()
+        && patch.revoked.is_none()
+    {
+        return Ok(Some(model.into_row()));
+    }
+    let mut active: ActiveModel = model.into();
+    if let Some(name) = patch.name {
+        active.name = Set(name);
+    }
+    if let Some(scopes) = patch.scopes {
+        active.scopes = Set(scopes);
+    }
+    if let Some(env) = patch.env {
+        active.env = Set(env);
+    }
+    if let Some(revoked) = patch.revoked {
+        active.revoked = Set(revoked);
+    }
+    let updated = active.update(&conn).await.map_err(map_err)?;
+    Ok(Some(updated.into_row()))
 }
 
 /// Catch-up hydration: keys strictly newer than `since` (org-scoped), ordered by
