@@ -751,19 +751,26 @@ async fn customer_preferences_json() -> Json<CustomerPreferences> {
 }
 
 async fn update_customer_preferences(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
     Json(payload): Json<CustomerPreferences>,
-) -> impl IntoResponse {
+) -> Response {
+    if let Err(e) = config.authenticator.authenticate(&headers).await {
+        return e;
+    }
     if !CUSTOMER_REGIONS.contains(&payload.region.as_str()) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "invalid_region", "ok": false })),
-        );
+        )
+            .into_response();
     }
     if !["comfortable", "compact"].contains(&payload.density.as_str()) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "invalid_density", "ok": false })),
-        );
+        )
+            .into_response();
     }
 
     (
@@ -774,6 +781,7 @@ async fn update_customer_preferences(
             "saved_at_ms": unix_epoch_ms(),
         })),
     )
+        .into_response()
 }
 
 async fn customer_security_sessions_json() -> Json<serde_json::Value> {
