@@ -338,4 +338,57 @@ mod tests {
             .expect("owner soft delete returns the row");
         assert!(deleted.revoked);
     }
+
+    #[tokio::test]
+    async fn catchup_returns_only_rows_newer_than_the_cursor() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("skip catchup_returns_only_rows_newer_than_the_cursor: TEST_DATABASE_URL unset");
+            return;
+        };
+        let org = make_org(&pool).await;
+        // Two keys at version 1; bump one to v2 so the cursor can separate them.
+        let a = insert_api_key(&pool, new_key(org, &uniq("fid_live"))).await.unwrap();
+        let _b = insert_api_key(&pool, new_key(org, &uniq("fid_live"))).await.unwrap();
+        upsert_fields(&pool, a.id, &[org], ApiKeyPatch { name: Some("bumped".into()), ..Default::default() })
+            .await
+            .unwrap();
+
+        // since=0 sees both; since=1 sees only the bumped (v2) row.
+        let all = catchup_api_keys(&pool, &[org], 0, 500).await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.windows(2).all(|w| w[0].version <= w[1].version), "ordered by version");
+        let newer = catchup_api_keys(&pool, &[org], 1, 500).await.unwrap();
+        assert_eq!(newer.len(), 1);
+        assert_eq!(newer[0].id, a.id);
+        assert!(newer[0].version > 1);
+
+        // Org-scoped: another org's cursor sees nothing here.
+        let other = make_org(&pool).await;
+        assert!(catchup_api_keys(&pool, &[other], 0, 500).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_idempotency_claim_then_replay() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("skip durable_idempotency_claim_then_replay: TEST_DATABASE_URL unset");
+            return;
+        };
+        let key = uniq("api_keys:k1:upsert:7");
+
+        // First claim wins; nothing committed yet (in-flight).
+        assert!(idem_claim(&pool, &key).await.unwrap(), "first claim owns the key");
+        assert_eq!(idem_committed(&pool, &key).await.unwrap(), Some(None), "claimed, in-flight");
+
+        // A concurrent claim loses.
+        assert!(!idem_claim(&pool, &key).await.unwrap(), "second claim is refused");
+
+        // Record the committed version; now every future lookup replays it —
+        // this is what survives a process restart (unlike the in-process cache).
+        idem_record(&pool, &key, 8).await.unwrap();
+        assert_eq!(idem_committed(&pool, &key).await.unwrap(), Some(Some(8)));
+        assert!(!idem_claim(&pool, &key).await.unwrap(), "committed key never re-claims");
+
+        // An unknown key has no record.
+        assert_eq!(idem_committed(&pool, "never-seen").await.unwrap(), None);
+    }
 }
