@@ -454,32 +454,47 @@ async fn create_customer_api_key(
 
 async fn rotate_customer_api_key(
     State(config): State<AppConfig>,
+    headers: HeaderMap,
     Json(payload): Json<RotateCustomerApiKeyRequest>,
-) -> impl IntoResponse {
+) -> Response {
+    let ctx = match config.authenticator.authenticate(&headers).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
     let prefix = payload.prefix.trim();
     if prefix.is_empty() || !prefix.starts_with("fid_") {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "invalid_key_prefix", "ok": false })),
-        );
+        )
+            .into_response();
     }
 
     let issued_at_ms = unix_epoch_ms();
     let replacement_secret = format!("{prefix}_{}", random_token_hex(24));
 
-    // DB path: replace the stored secret hash. The bump_row_version trigger
-    // advances `version` + `updated_at`; broadcast the bumped row.
+    // DB path: replace the stored secret hash, scoped to the caller's org so one
+    // tenant can never rotate another tenant's key. The bump_row_version trigger
+    // advances `version` + `updated_at`; broadcast the bumped row. A prefix that
+    // is not the caller's org yields `Ok(None)` (no-op), reported as not-found.
     if let Some(pool) = &config.pool {
         match sqlx::query_as::<_, ApiKeysRow>(
-            "update api_keys set secret_hash = $1 where key_id = $2 returning *",
+            "update api_keys set secret_hash = $1 where key_id = $2 and org_id = any($3) returning *",
         )
         .bind(hash_secret(&replacement_secret))
         .bind(prefix)
+        .bind(ctx.org_uuids())
         .fetch_optional(pool)
         .await
         {
             Ok(Some(row)) => broadcast_api_key_change(&config, &row),
-            Ok(None) => {}
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "ok": false, "error": "key_not_found" })),
+                )
+                    .into_response();
+            }
             Err(err) => tracing::error!("api_key rotate failed: {err}"),
         }
     }
@@ -494,6 +509,7 @@ async fn rotate_customer_api_key(
             "overlap_seconds": 900,
         })),
     )
+        .into_response()
 }
 
 /// The @fiducia/sync write path, generic in `{table}` (only `api_keys` is DB-wired
