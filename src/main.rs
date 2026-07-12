@@ -349,13 +349,7 @@ async fn customer_api_keys_json(State(config): State<AppConfig>, headers: Header
     // failure degrades to the mock so a rendered table never disappears on a blip.
     // Scoped to the caller's org(s) — a key list must never disclose other tenants.
     let keys = match &config.pool {
-        Some(pool) => match sqlx::query_as::<_, ApiKeysRow>(
-            "select * from api_keys where org_id = any($1) order by created_at asc",
-        )
-        .bind(ctx.org_uuids())
-        .fetch_all(pool)
-        .await
-        {
+        Some(pool) => match store::list_api_keys(pool, &ctx.org_uuids()).await {
             Ok(rows) => rows.iter().map(api_key_row_to_display).collect::<Vec<_>>(),
             Err(err) => {
                 tracing::error!("api_keys list query failed: {err}");
