@@ -192,32 +192,35 @@ mod tests {
 
     const SCHEMA: &str = include_str!("../../fiducia-interfaces/sql/customer.sql");
 
-    // One shared pool + one schema apply for the whole module. Tests run
-    // concurrently, so applying `customer.sql` per-test races on
-    // `create or replace function` (two sessions insert the same pg_proc row).
-    // `OnceCell` collapses init to exactly once; the pool is cheap to clone.
-    static POOL: tokio::sync::OnceCell<Option<PgPool>> = tokio::sync::OnceCell::const_new();
+    // Each test owns its pool (a sqlx pool is bound to the runtime that created
+    // it, and every `#[tokio::test]` spins a fresh runtime — a shared pool would
+    // dangle). The schema apply, however, is serialized + done once: concurrent
+    // `create or replace function` from two sessions races on the pg_proc unique
+    // index, so we guard it behind an async mutex + a done-flag.
+    static SCHEMA_READY: tokio::sync::Mutex<bool> = tokio::sync::Mutex::const_new(false);
 
     async fn pool_or_skip() -> Option<PgPool> {
-        POOL.get_or_init(|| async {
-            let url = std::env::var("TEST_DATABASE_URL")
-                .ok()
-                .filter(|v| !v.is_empty())?;
-            let pool = PgPoolOptions::new()
-                .max_connections(8)
-                .connect(&url)
-                .await
-                .expect("connect TEST_DATABASE_URL");
-            // Canonical customer schema; idempotent (`create ... if not exists`),
-            // and the Supabase realtime/RLS blocks are no-ops on a plain Postgres.
-            sqlx::raw_sql(SCHEMA)
-                .execute(&pool)
-                .await
-                .expect("apply customer.sql");
-            Some(pool)
-        })
-        .await
-        .clone()
+        let url = std::env::var("TEST_DATABASE_URL")
+            .ok()
+            .filter(|v| !v.is_empty())?;
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&url)
+            .await
+            .expect("connect TEST_DATABASE_URL");
+        {
+            let mut ready = SCHEMA_READY.lock().await;
+            if !*ready {
+                // Canonical customer schema; idempotent, and the Supabase
+                // realtime/RLS blocks are no-ops on a plain Postgres.
+                sqlx::raw_sql(SCHEMA)
+                    .execute(&pool)
+                    .await
+                    .expect("apply customer.sql");
+                *ready = true;
+            }
+        }
+        Some(pool)
     }
 
     fn uniq(prefix: &str) -> String {
