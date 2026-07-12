@@ -588,44 +588,27 @@ async fn sync_write_api_keys_row(
     let committed = if op == "delete" {
         // A delete on a revocable credential is a soft revoke, not a row drop, so
         // audit/history stay intact. Version still bumps.
-        sqlx::query_as::<_, ApiKeysRow>(
-            "update api_keys set revoked = true where id = $1 and org_id = any($2) returning *",
-        )
-        .bind(id)
-        .bind(&orgs)
-        .fetch_optional(pool)
-        .await
+        store::soft_delete(pool, id, &orgs).await
     } else {
         let payload = req.payload.clone().unwrap_or_else(|| json!({}));
-        let name = payload.get("name").and_then(|v| v.as_str());
-        let scopes = payload_scopes(&payload);
-        let env = payload
-            .get("environment")
-            .and_then(|v| v.as_str())
-            .or_else(|| payload.get("env").and_then(|v| v.as_str()));
         let revoked = match payload.get("status").and_then(|v| v.as_str()) {
             Some("revoked") => Some(true),
             Some(_) => Some(false),
             None => payload.get("revoked").and_then(|v| v.as_bool()),
         };
+        let patch = store::ApiKeyPatch {
+            name: payload.get("name").and_then(|v| v.as_str()).map(str::to_owned),
+            scopes: payload_scopes(&payload),
+            env: payload
+                .get("environment")
+                .and_then(|v| v.as_str())
+                .or_else(|| payload.get("env").and_then(|v| v.as_str()))
+                .map(str::to_owned),
+            revoked,
+        };
         // COALESCE keeps existing values for any field the client omitted; the
         // trigger bumps version + updated_at on the UPDATE.
-        sqlx::query_as::<_, ApiKeysRow>(
-            "update api_keys set \
-                name = coalesce($2, name), \
-                scopes = coalesce($3, scopes), \
-                env = coalesce($4, env), \
-                revoked = coalesce($5, revoked) \
-             where id = $1 and org_id = any($6) returning *",
-        )
-        .bind(id)
-        .bind(name)
-        .bind(scopes)
-        .bind(env)
-        .bind(revoked)
-        .bind(&orgs)
-        .fetch_optional(pool)
-        .await
+        store::upsert_fields(pool, id, &orgs, patch).await
     };
 
     match committed {
