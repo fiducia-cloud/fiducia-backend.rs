@@ -31,7 +31,7 @@ It serves two things:
 | `/app/ws` | customer portal WebSocket heartbeat for non-sensitive refresh events |
 | `/app/events` | SSE fallback heartbeat for non-sensitive refresh events           |
 | `/app/fragments/*` | customer-safe HTML views; cluster-wide data stays hidden    |
-| `/api/customer/*` | authenticated, Postgres-backed customer data APIs             |
+| `/api/customer/*` | authenticated customer BFF APIs                              |
 | `/_customer/*` | customer portal Vite assets (`CUSTOMER_STATIC_DIR`)             |
 | everything else | the static [Astro](https://astro.build) site (`STATIC_DIR`)     |
 
@@ -62,29 +62,32 @@ does not add a path prefix (the gateway strips `/fiducia/` before requests
 arrive — the Astro build carries the `/fiducia` base so asset URLs round-trip).
 `CUSTOMER_STATIC_DIR` defaults to `customer-static`. If `SUPABASE_URL` and
 `SUPABASE_ANON_KEY` are set, the rendered portal passes them to the browser for
-Supabase realtime subscriptions.
+Supabase login and session management.
 
 `DATABASE_URL` is required. The service refuses to start without durable
-customer Postgres. Customer preferences, sessions, API keys, and sync
-idempotency are persisted; dependency failures return explicit errors instead
-of invented successes or sample rows.
+customer Postgres. Customer preferences and local session observations are
+persisted there. API-key lifecycle is delegated to `fiducia-auth`, the sole
+credential authority and introspection source; dependency failures return
+explicit errors instead of falling back to a second key store.
 
-API-key rotation replaces the old secret immediately (`overlap_seconds=0`);
-deploy callers accordingly. The portal can display locally observed session
+API-key create/list/rotate requests are authenticated here and proxied to
+`fiducia-auth`; only its sanitized metadata contract is returned. Rotation
+replaces the authoritative secret immediately and reports the bounded positive
+edge/LB cache overlap to the caller. The portal can display locally observed session
 records, but provider-backed session revocation is intentionally reported as
 unsupported until Supabase session identifiers and Admin revocation are wired.
 TOTP enrollment is available in the UI, but production-key issuance is not yet
 gated on AAL2; do not treat enrollment as an enforced issuance policy. Privileged
 admin scopes are not issued by this customer-membership-only API.
 
-The customer browser keeps one tenant-filtered Supabase realtime WebSocket and
-one backend heartbeat stream. The heartbeat prefers `/app/ws` and falls back to
-`/app/events`; it carries only generic refresh frames and never customer rows,
-API-key metadata, or credentials. Durable customer changes are loaded through
-authenticated, tenant-scoped catch-up APIs or Supabase RLS subscriptions.
-The portal does not expose `fiducia-node`'s cluster-wide observability APIs as
-customer data. Those panels explicitly remain unavailable until the node has an
-authenticated tenant-scoped read contract.
+The customer browser keeps one backend heartbeat stream. It prefers `/app/ws`
+and falls back to `/app/events`; it carries only generic refresh frames and
+never customer rows, API-key metadata, or credentials. Sanitized API-key
+metadata is loaded through the authenticated BFF catch-up API; raw `api_keys`
+Supabase CDC is not exposed to browsers.
+The portal does not expose `fiducia-node`'s cluster-wide locks, requests, KV, or
+service-discovery views. Those operator routes and panels exist only in the
+separately deployed admin application.
 
 ## Configuration
 
@@ -101,8 +104,8 @@ closed (`Deny`).
 | `CUSTOMER_APP_HOST` | string (host) | no | Host that serves the customer portal at `/`. | `app.fiducia.cloud` |
 | `FIDUCIA_SITE_MODE` | string (mode) | no | `customer` renders the portal at `/` regardless of host. Any other/unset value uses the **safe** host-based routing (portal only at `/app` or for `CUSTOMER_APP_HOST`). | unset → host-based (safe) |
 | `FIDUCIA_AUTH_URL` | string (URL) | no | Base URL of `fiducia-auth`; verifies customer Supabase sessions. **Unset → fail closed**: every `/api/customer/*` route denies. | unset → `Deny` |
-| `SUPABASE_URL` | string (URL) | no | Supabase project URL handed to the browser for realtime. | unset |
-| `SUPABASE_ANON_KEY` | string (key) | no (anon/public key) | Supabase **anon (public)** key handed to the browser for realtime. Not a service-role secret. | unset |
+| `SUPABASE_URL` | string (URL) | no | Supabase project URL handed to the browser for login/session management. | unset |
+| `SUPABASE_ANON_KEY` | string (key) | no (anon/public key) | Supabase **anon (public)** key handed to the browser for login/session management. Not a service-role secret. | unset |
 | `DATABASE_URL` | string (URL) | **yes** (DB credentials) | Customer Postgres. **Required** — the service refuses to start without it. | none (required) |
 | `TEST_DATABASE_URL` | string (URL) | **yes** (DB credentials) | Postgres the test harness may create/drop freely; gates the store integration tests (unset → those tests skip). | unset |
 
@@ -148,12 +151,14 @@ There is no `FIDUCIA_ALLOW_INSECURE_*`/dev-session toggle; the only test-auth
 escape hatch (`FIDUCIA_E2E_STATIC_CUSTOMER_AUTH`) is compiled out of release
 builds.
 
-**Hardening in place.** All SQL is parameterized (`sqlx` `.bind`, no string
-concatenation). The middleware stack sets `X-Content-Type-Options: nosniff`,
+**Hardening in place.** Application persistence uses typed SeaORM entities and
+does not construct SQL from request input. The middleware stack sets
+`X-Content-Type-Options: nosniff`,
 `X-Frame-Options: DENY`, a referrer policy, a permissions policy, and a CSP; it
 bounds request time (`TimeoutLayer`, 30s), caps bodies (`RequestBodyLimitLayer`,
-64 KiB), and catches handler panics (`CatchPanicLayer`). API-key secrets use the
-OS CSPRNG and only their hash is persisted. There is no permissive CORS layer.
+64 KiB), and catches handler panics (`CatchPanicLayer`). API-key generation,
+hash persistence, rotation, and introspection are owned by `fiducia-auth`; this
+service never mints a parallel credential. There is no permissive CORS layer.
 
 **Heartbeat no longer fans out customer rows.** A process-wide broadcast channel
 that placed `api_keys` change frames onto the public `/app/ws` + `/app/events`
@@ -164,7 +169,8 @@ tenant-scoped catch-up APIs or Supabase RLS subscriptions.
 **Accepted advisories** (no clean in-semver fix; recorded rather than force-fixed):
 
 - `rsa` [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071) —
-  Marvin timing side-channel. Transitive (via `sqlx`'s MySQL path, unused here);
+  Marvin timing side-channel. Transitive through SeaORM's SQL driver dependency
+  (the MySQL path is unused here);
   no fixed upgrade is published.
 - `proc-macro-error` [RUSTSEC-2024-0370](https://rustsec.org/advisories/RUSTSEC-2024-0370)
   and `proc-macro-error2` [RUSTSEC-2026-0173](https://rustsec.org/advisories/RUSTSEC-2026-0173)
