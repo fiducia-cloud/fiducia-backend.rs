@@ -799,8 +799,63 @@ fn mock_api_keys_display() -> Vec<serde_json::Value> {
     api_keys().iter().map(api_key_json).collect()
 }
 
-async fn customer_preferences_json() -> Json<CustomerPreferences> {
-    Json(default_customer_preferences())
+/// Resolve the caller's local `users.id`, provisioning the row on first access.
+/// `None` when there is no DB pool or the session subject is not a UUID (e.g. the
+/// no-DB dev/test path), so callers fall back to defaults.
+async fn caller_user_id(config: &AppConfig, ctx: &CustomerCtx) -> Option<Uuid> {
+    let pool = config.pool.as_ref()?;
+    let sub = Uuid::parse_str(&ctx.user_id).ok()?;
+    let email = ctx
+        .email
+        .clone()
+        .unwrap_or_else(|| format!("{sub}@users.fiducia.cloud"));
+    match store::ensure_user(pool, sub, &email).await {
+        Ok(id) => Some(id),
+        Err(err) => {
+            tracing::error!("ensure_user failed: {err}");
+            None
+        }
+    }
+}
+
+fn prefs_from_row(row: &crate::entity::customer_preferences::Model) -> CustomerPreferences {
+    CustomerPreferences {
+        region: row.region.clone(),
+        timezone: row.timezone.clone(),
+        density: row.density.clone(),
+        notify_lock_contention: row.notify_lock_contention,
+        notify_key_rotation: row.notify_key_rotation,
+        notify_mfa: row.notify_mfa,
+    }
+}
+
+fn session_model_json(row: &crate::entity::customer_sessions::Model) -> serde_json::Value {
+    json!({
+        "device": row.device,
+        "location": row.location,
+        "last_seen": row.last_seen.to_rfc3339(),
+        "status": row.status,
+    })
+}
+
+async fn customer_preferences_json(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
+    let ctx = match config.authenticator.authenticate(&headers).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let prefs = match (config.pool.as_ref(), caller_user_id(&config, &ctx).await) {
+        (Some(pool), Some(uid)) => match store::get_preferences(pool, uid).await {
+            Ok(Some(row)) => prefs_from_row(&row),
+            Ok(None) => default_customer_preferences(),
+            Err(err) => {
+                tracing::error!("get_preferences failed: {err}");
+                default_customer_preferences()
+            }
+        },
+        // No DB (dev/test) → the documented defaults.
+        _ => default_customer_preferences(),
+    };
+    Json(prefs).into_response()
 }
 
 async fn update_customer_preferences(
