@@ -9,7 +9,7 @@
 //! DB-behavior tests in `tests/api_keys_store.rs` pin this seam's semantics so an
 //! engine swap (raw SQL → ORM) is provably behaviour-preserving.
 
-use fiducia_interfaces_db::customer::ApiKeysRow;
+use fiducia_interfaces_db::customer::{ApiKeysRow, CustomerPreferencesRow, CustomerSessionsRow};
 use sqlx::PgPool;
 use uuid::Uuid;
 
