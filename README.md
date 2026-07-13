@@ -28,8 +28,8 @@ It serves two things:
 | `/healthz`, `/api/health` | health probe                                          |
 | `/api/info` | service / version JSON                                              |
 | `/app`, `/app/*` | customer portal rendered by axum + Maud and refreshed by HTMX |
-| `/app/ws` | customer portal WebSocket stream for refresh and sync events          |
-| `/app/events` | SSE fallback stream for refresh and sync events                   |
+| `/app/ws` | customer portal WebSocket heartbeat for non-sensitive refresh events |
+| `/app/events` | SSE fallback heartbeat for non-sensitive refresh events           |
 | `/app/fragments/*` | customer-safe HTML views; cluster-wide data stays hidden    |
 | `/api/customer/*` | authenticated, Postgres-backed customer data APIs             |
 | `/_customer/*` | customer portal Vite assets (`CUSTOMER_STATIC_DIR`)             |
@@ -69,8 +69,11 @@ customer Postgres. Customer preferences, sessions, API keys, and sync
 idempotency are persisted; dependency failures return explicit errors instead
 of invented successes or sample rows.
 
-The customer browser keeps one Supabase realtime WebSocket and one backend
-stream. The backend stream prefers `/app/ws` and falls back to `/app/events`.
+The customer browser keeps one tenant-filtered Supabase realtime WebSocket and
+one backend heartbeat stream. The heartbeat prefers `/app/ws` and falls back to
+`/app/events`; it carries only generic refresh frames and never customer rows,
+API-key metadata, or credentials. Durable customer changes are loaded through
+authenticated, tenant-scoped catch-up APIs or Supabase RLS subscriptions.
 The portal does not expose `fiducia-node`'s cluster-wide observability APIs as
 customer data. Those panels explicitly remain unavailable until the node has an
 authenticated tenant-scoped read contract.
