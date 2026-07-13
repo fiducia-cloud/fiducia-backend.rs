@@ -1,9 +1,8 @@
 //! Customer session authentication for the `/api/customer/*` surface.
 //!
 //! Before this module these routes were unauthenticated: anyone on the internet
-//! could mint a live API key (and receive the plaintext secret) or drive the
-//! `/sync/:table` write path against arbitrary rows. They are now gated on a
-//! verified Supabase session and scoped to the caller's org.
+//! could mint a live API key (and receive the plaintext secret). They are now
+//! gated on a verified Supabase session and scoped to the caller's org.
 //!
 //! Verification is delegated to **fiducia-auth** (`GET /v1/me`) — the one place
 //! that verifies Supabase JWTs — rather than re-implementing JWKS crypto here.
@@ -32,16 +31,6 @@ pub struct CustomerCtx {
     /// Orgs the user belongs to (admin-controlled claims; see fiducia-auth).
     #[serde(default)]
     pub orgs: Vec<String>,
-}
-
-impl CustomerCtx {
-    /// Caller's orgs parsed to UUIDs, for scoping SQL to rows they own.
-    pub fn org_uuids(&self) -> Vec<uuid::Uuid> {
-        self.orgs
-            .iter()
-            .filter_map(|o| uuid::Uuid::parse_str(o).ok())
-            .collect()
-    }
 }
 
 /// How a request is authenticated. Production verifies via fiducia-auth; tests

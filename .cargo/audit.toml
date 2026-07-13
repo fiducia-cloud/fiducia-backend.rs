@@ -1,0 +1,11 @@
+# cargo-audit exceptions are limited to dependencies with no runtime path.
+[advisories]
+ignore = [
+    # Present only in Cargo.lock through sqlx-mysql. `cargo tree --all-features
+    # --target all -i rsa` has no path because this service enables PostgreSQL only.
+    "RUSTSEC-2023-0071",
+    # Unmaintained build-time proc-macro dependencies; neither is linked into the
+    # running service. Track them until upstream SeaORM/sqlx releases remove them.
+    "RUSTSEC-2024-0370",
+    "RUSTSEC-2026-0173",
+]

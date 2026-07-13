@@ -1,6 +1,7 @@
 // fiducia-backend entrypoint: the axum app for fiducia.cloud's website tier.
 // Serves the static Astro marketing site, the Maud/HTMX customer portal and its
-// WS/SSE fragment streams, plus the DB-backed api_keys + @fiducia/sync endpoints.
+// WS/SSE fragment streams, plus authenticated customer APIs. API-key lifecycle
+// is delegated to fiducia-auth so there is exactly one credential authority.
 mod auth;
 mod entity;
 mod store;
@@ -12,12 +13,10 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{routing::get, Json, Router};
-use fiducia_interfaces_db::customer::ApiKeysRow;
-use fiducia_sync_core::WriteAck;
 use maud::{html, Markup, PreEscaped, DOCTYPE};
+use sea_orm::{Database, DatabaseConnection};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::PgPool;
 use std::convert::Infallible;
 use std::io;
 use std::net::SocketAddr;
@@ -40,6 +39,7 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 const STREAM_HEARTBEAT_SECS: u64 = 15;
 const CUSTOMER_WS_PATH: &str = "/app/ws";
 const CUSTOMER_EVENTS_PATH: &str = "/app/events";
+const CUSTOMER_ORG_HEADER: &str = "x-fiducia-org-id";
 
 const CUSTOMER_REGIONS: &[&str] = &["auto", "iad1", "sfo1", "ams1", "fra1", "sin1", "syd1"];
 
@@ -60,7 +60,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Customer state is always durable. A missing/unreachable database is a
     // deployment error, not permission to serve invented customer data.
-    let pool = connect_customer_db().await?;
+    let pool = match connect_customer_db().await {
+        Ok(pool) => Some(pool),
+        Err(error)
+            if cfg!(debug_assertions)
+                && std::env::var("FIDUCIA_E2E_ALLOW_NO_DATABASE").as_deref() == Ok("1") =>
+        {
+            tracing::warn!(error = %error, "E2E-only: starting customer shell without Postgres");
+            None
+        }
+        Err(error) => return Err(error),
+    };
 
     let config = AppConfig {
         static_dir: static_dir.clone(),
@@ -74,7 +84,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         supabase_anon_key: std::env::var("SUPABASE_ANON_KEY")
             .ok()
             .filter(|v| !v.is_empty()),
-        pool: Some(pool),
+        auth_url: std::env::var("FIDUCIA_AUTH_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| v.trim_end_matches('/').to_string()),
+        pool,
         authenticator: Authenticator::from_env(),
     };
 
@@ -98,13 +112,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Connect to the customer Postgres plane. Production startup fails closed when
 /// `DATABASE_URL` is absent or unreachable.
-async fn connect_customer_db() -> Result<PgPool, Box<dyn std::error::Error>> {
+async fn connect_customer_db() -> Result<DatabaseConnection, Box<dyn std::error::Error>> {
     let url = required_env("DATABASE_URL")?;
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&url)
-        .await?;
-    pool.acquire().await?;
+    let pool = Database::connect(&url).await?;
+    pool.ping().await?;
     tracing::info!("customer DB connected — customer state is durable");
     Ok(pool)
 }
@@ -137,6 +148,7 @@ fn build_router(config: AppConfig) -> Router {
         .route("/healthz", get(health))
         .route("/api/health", get(health))
         .route("/api/info", get(info))
+        .route("/api/customer/context", get(customer_context_json))
         .route(
             "/api/customer/api-keys",
             get(customer_api_keys_json).post(create_customer_api_key),
@@ -145,14 +157,14 @@ fn build_router(config: AppConfig) -> Router {
             "/api/customer/api-keys/rotate",
             axum::routing::post(rotate_customer_api_key),
         )
-        // Local-first sync write path: the @fiducia/sync client POSTs queued
-        // optimistic writes to /api/customer/sync/{table}; we persist via SQLx and
-        // return the committed row version so the client can adopt it and clear
-        // `dirty`. Generic in the table (only api_keys is DB-wired today).
         .route(
-            "/api/customer/sync/:table",
-            axum::routing::post(sync_write).get(sync_catchup),
+            "/api/customer/api-keys/revoke",
+            axum::routing::post(revoke_customer_api_key),
         )
+        // Read-only authenticated catch-up for local browser hydration. Credential
+        // mutations go through the explicit create/rotate endpoints above and are
+        // owned by fiducia-auth; this BFF exposes no second write authority.
+        .route("/api/customer/sync/:table", get(sync_catchup))
         .route(
             "/api/customer/preferences",
             get(customer_preferences_json).put(update_customer_preferences),
@@ -175,17 +187,9 @@ fn build_router(config: AppConfig) -> Router {
         .route("/app/security", get(customer_security))
         .route("/app/settings", get(customer_settings))
         .route("/app/preferences", get(customer_settings))
-        .route("/app/locks", get(customer_locks))
-        .route("/app/requests", get(customer_requests))
-        .route("/app/kv", get(customer_kv))
-        .route("/app/services", get(customer_services))
         .route(CUSTOMER_WS_PATH, get(customer_ws))
         .route(CUSTOMER_EVENTS_PATH, get(customer_events))
         .route("/app/fragments/summary", get(summary_fragment))
-        .route("/app/fragments/locks", get(locks_fragment))
-        .route("/app/fragments/requests", get(requests_fragment))
-        .route("/app/fragments/kv", get(kv_fragment))
-        .route("/app/fragments/services", get(services_fragment))
         // Generated API docs (AGENTS.md "API Docs Contract").
         .route("/docs/api", get(api_docs_html))
         .route("/api/docs", get(api_docs_html))
@@ -235,9 +239,11 @@ struct AppConfig {
     customer_site_mode: bool,
     supabase_url: Option<String>,
     supabase_anon_key: Option<String>,
-    /// Customer Postgres pool. `None` exists only in isolated route tests and
-    /// always produces a service-unavailable response.
-    pool: Option<PgPool>,
+    /// Base URL of the sole customer credential authority (`fiducia-auth`).
+    auth_url: Option<String>,
+    /// Customer Postgres connection. `None` exists only in isolated tests and a
+    /// debug-only browser harness; data routes then fail closed.
+    pool: Option<DatabaseConnection>,
     /// Verifies the customer's Supabase session for `/api/customer/*` and scopes
     /// writes to their org. Fail-closed (`Deny`) when no auth backend is set.
     authenticator: Authenticator,
@@ -288,23 +294,44 @@ struct RotateCustomerApiKeyRequest {
     prefix: String,
 }
 
-/// One queued optimistic write from the @fiducia/sync client. `table` is implied
-/// by the route (`api_keys`) but echoed by the client, so we accept it. `payload`
-/// is the row the client optimistically stored; `base_version` is the version it
-/// was edited on top of (for the ack the client reconciles against).
-#[derive(Debug, Deserialize, Serialize)]
-struct SyncWriteRequest {
-    id: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    table: Option<String>,
-    #[serde(default)]
-    op: Option<String>,
-    #[serde(default)]
-    payload: Option<serde_json::Value>,
-    #[serde(default)]
-    #[serde(rename = "base_version")]
-    _base_version: Option<i64>,
+#[derive(Debug, Deserialize)]
+struct RevokeCustomerApiKeyRequest {
+    prefix: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthKeyMeta {
+    key_id: String,
+    name: String,
+    scopes: Vec<String>,
+    env: String,
+    last_used_ms: Option<u64>,
+    revoked: bool,
+    version: u64,
+    require_idempotency: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthKeyListResponse {
+    keys: Vec<AuthKeyMeta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthKeyCreateResponse {
+    api_key: String,
+    key: AuthKeyMeta,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthKeyRotateResponse {
+    api_key: String,
+    key: AuthKeyMeta,
+    overlap_seconds: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthKeyRevokeResponse {
+    revoked: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -323,7 +350,7 @@ struct CustomerPreferences {
 }
 
 #[allow(clippy::result_large_err)] // Axum handlers return the framework Response directly.
-fn customer_pool(config: &AppConfig) -> Result<&PgPool, Response> {
+fn customer_pool(config: &AppConfig) -> Result<&DatabaseConnection, Response> {
     config.pool.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -346,19 +373,174 @@ fn dependency_error(dependency: &str, code: &str, error: impl std::fmt::Display)
         .into_response()
 }
 
+#[allow(clippy::result_large_err)]
+fn selected_customer_org(ctx: &CustomerCtx, headers: &HeaderMap) -> Result<String, Response> {
+    if let Some(requested) = headers.get(CUSTOMER_ORG_HEADER) {
+        let requested = requested.to_str().map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": "invalid_org_selection" })),
+            )
+                .into_response()
+        })?;
+        let requested = requested.trim();
+        if requested.is_empty() || requested.len() > 128 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": "invalid_org_selection" })),
+            )
+                .into_response());
+        }
+        if ctx.orgs.iter().any(|org_id| org_id == requested) {
+            return Ok(requested.to_string());
+        }
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "ok": false, "error": "forbidden_org" })),
+        )
+            .into_response());
+    }
+
+    match ctx.orgs.as_slice() {
+        [] => Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "ok": false, "error": "no_org_membership" })),
+        )
+            .into_response()),
+        [org_id] => Ok(org_id.clone()),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "org_selection_required" })),
+        )
+            .into_response()),
+    }
+}
+
+async fn auth_json(
+    config: &AppConfig,
+    headers: &HeaderMap,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<(StatusCode, serde_json::Value), Response> {
+    let Some(base) = config.auth_url.as_deref() else {
+        return Err(dependency_error(
+            "fiducia-auth",
+            "customer_key_authority_not_configured",
+            "FIDUCIA_AUTH_URL is unset",
+        ));
+    };
+    let Some(bearer) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "ok": false, "error": "missing_bearer_token" })),
+        )
+            .into_response());
+    };
+    let mut request = reqwest::Client::new()
+        .request(method, format!("{base}{path}"))
+        .header(reqwest::header::AUTHORIZATION, bearer);
+    if let Some(idempotency_key) = headers.get("idempotency-key") {
+        request = request.header("idempotency-key", idempotency_key);
+    }
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request.send().await.map_err(|error| {
+        dependency_error("fiducia-auth", "customer_key_authority_unreachable", error)
+    })?;
+    let status =
+        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| {
+            dependency_error("fiducia-auth", "customer_key_authority_bad_response", error)
+        })?;
+    Ok((status, body))
+}
+
+fn proxied_auth_error(status: StatusCode, body: serde_json::Value) -> Response {
+    let error = body
+        .get("error")
+        .cloned()
+        .unwrap_or_else(|| json!("credential_authority_rejected_request"));
+    (status, Json(json!({ "ok": false, "error": error }))).into_response()
+}
+
+fn auth_key_to_display(key: &AuthKeyMeta) -> Result<serde_json::Value, &'static str> {
+    if key.key_id.is_empty() || !matches!(key.env.as_str(), "live" | "test") || key.version == 0 {
+        return Err("invalid key metadata");
+    }
+    Ok(json!({
+        "id": key.key_id,
+        "name": key.name,
+        "prefix": format!("fdc_{}_{}", key.env, key.key_id),
+        "scopes": key.scopes.join(", "),
+        "last_used": if key.last_used_ms.is_some() { "recently" } else { "never" },
+        "status": if key.revoked { "revoked" } else { "active" },
+        "environment": key.env,
+        "require_idempotency": key.require_idempotency,
+        "version": key.version,
+    }))
+}
+
+fn auth_key_id_from_prefix(prefix: &str) -> Option<&str> {
+    let rest = prefix.strip_prefix("fdc_")?;
+    let (environment, key_id) = rest.split_once('_')?;
+    if matches!(environment, "live" | "test") && !key_id.is_empty() {
+        Some(key_id)
+    } else {
+        None
+    }
+}
+
+fn encode_query_value(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
 async fn customer_api_keys_json(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
     let ctx = match config.authenticator.authenticate(&headers).await {
         Ok(c) => c,
         Err(e) => return e,
     };
-    let pool = match customer_pool(&config) {
-        Ok(pool) => pool,
+    let org_id = match selected_customer_org(&ctx, &headers) {
+        Ok(org_id) => org_id,
         Err(response) => return response,
     };
-    // Scoped to the caller's org(s) — a key list must never disclose other tenants.
-    let keys = match store::list_api_keys(pool, &ctx.org_uuids()).await {
-        Ok(rows) => rows.iter().map(api_key_row_to_display).collect::<Vec<_>>(),
-        Err(err) => return dependency_error("postgres", "api_keys_list_failed", err),
+    let path = format!("/v1/keys?org_id={}", encode_query_value(&org_id));
+    let (status, body) = match auth_json(&config, &headers, reqwest::Method::GET, &path, None).await
+    {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    if !status.is_success() {
+        return proxied_auth_error(status, body);
+    }
+    let response: AuthKeyListResponse = match serde_json::from_value(body) {
+        Ok(response) => response,
+        Err(error) => return dependency_error("fiducia-auth", "auth_key_list_bad_response", error),
+    };
+    let keys = match response
+        .keys
+        .iter()
+        .map(auth_key_to_display)
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(keys) => keys,
+        Err(error) => return dependency_error("fiducia-auth", "auth_key_list_bad_response", error),
     };
 
     Json(json!({
@@ -366,6 +548,21 @@ async fn customer_api_keys_json(State(config): State<AppConfig>, headers: Header
         "default_require_idempotency": true,
         "allowed_environments": ["live", "test"],
         "allowed_scopes": allowed_api_key_scopes(),
+    }))
+    .into_response()
+}
+
+async fn customer_context_json(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
+    let ctx = match config.authenticator.authenticate(&headers).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    Json(json!({
+        "user": {
+            "user_id": ctx.user_id,
+            "email": ctx.email,
+            "orgs": ctx.orgs,
+        }
     }))
     .into_response()
 }
@@ -385,58 +582,57 @@ async fn create_customer_api_key(
             Json(json!({ "error": error, "ok": false })),
         )
             .into_response();
-    }
-
-    let environment_prefix = if payload.environment == "live" {
-        "fid_live"
-    } else {
-        "fid_test"
     };
-    // The prefix is a public identifier (safe to derive); the secret must not
-    // be — it is CSPRNG bytes, unguessable from the creation time.
-    let prefix = format!("{environment_prefix}_{}", &random_token_hex(4)[..8]);
-    let secret = format!("{prefix}_{}", random_token_hex(24));
 
-    let pool = match customer_pool(&config) {
-        Ok(pool) => pool,
+    let org_id = match selected_customer_org(&ctx, &headers) {
+        Ok(org_id) => org_id,
         Err(response) => return response,
     };
-    // Persist the key (storing only the secret hash) under the CALLER's org.
-    // Other sessions rehydrate through authenticated tenant-scoped APIs; customer
-    // rows are never placed on the public portal heartbeat stream.
-    let Some(org_id) = ctx.org_uuids().into_iter().next() else {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({ "ok": false, "error": "no_org_membership" })),
-        )
-            .into_response();
+    let request = json!({
+        "name": payload.name.trim(),
+        "org_id": org_id,
+        "scopes": [payload.scope],
+        "env": payload.environment,
+        "require_idempotency": payload.require_idempotency.unwrap_or(true),
+    });
+    let (status, body) = match auth_json(
+        &config,
+        &headers,
+        reqwest::Method::POST,
+        "/v1/keys",
+        Some(request),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(response) => return response,
     };
-    let new_key = store::NewApiKey {
-        key_id: &prefix,
-        org_id,
-        name: payload.name.trim(),
-        secret_hash: hash_secret(&secret),
-        scopes: json!([payload.scope]),
-        env: &payload.environment,
-    };
-    match store::insert_api_key(pool, new_key).await {
-        Ok(row) => {
-            let mut api_key = api_key_row_to_display(&row);
-            api_key["environment"] = json!(payload.environment);
-            api_key["require_idempotency"] = json!(payload.require_idempotency.unwrap_or(true));
-            (
-                StatusCode::CREATED,
-                Json(json!({
-                    "ok": true,
-                    "api_key": api_key,
-                    "secret": secret,
-                    "secret_once": true,
-                })),
-            )
-                .into_response()
-        }
-        Err(err) => dependency_error("postgres", "api_key_insert_failed", err),
+    if !status.is_success() {
+        return proxied_auth_error(status, body);
     }
+    let response: AuthKeyCreateResponse = match serde_json::from_value(body) {
+        Ok(response) => response,
+        Err(error) => {
+            return dependency_error("fiducia-auth", "auth_key_create_bad_response", error)
+        }
+    };
+    let display = match auth_key_to_display(&response.key) {
+        Ok(display) => display,
+        Err(error) => {
+            return dependency_error("fiducia-auth", "auth_key_create_bad_response", error)
+        }
+    };
+    (
+        StatusCode::CREATED,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({
+            "ok": true,
+            "api_key": display,
+            "secret": response.api_key,
+            "secret_once": true,
+        })),
+    )
+        .into_response()
 }
 
 async fn rotate_customer_api_key(
@@ -449,227 +645,127 @@ async fn rotate_customer_api_key(
         Err(e) => return e,
     };
     let prefix = payload.prefix.trim();
-    if prefix.is_empty() || !prefix.starts_with("fid_") {
+    let Some(key_id) = auth_key_id_from_prefix(prefix) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "invalid_key_prefix", "ok": false })),
         )
             .into_response();
-    }
+    };
 
-    let issued_at_ms = unix_epoch_ms();
-    let replacement_secret = format!("{prefix}_{}", random_token_hex(24));
-
-    let pool = match customer_pool(&config) {
-        Ok(pool) => pool,
+    let org_id = match selected_customer_org(&ctx, &headers) {
+        Ok(org_id) => org_id,
         Err(response) => return response,
     };
-    // Replace the stored secret hash, scoped to the caller's org so one
-    // tenant can never rotate another tenant's key. The bump_row_version trigger
-    // advances `version` + `updated_at`. A prefix that
-    // is not the caller's org yields `Ok(None)` (no-op), reported as not-found.
-    match store::rotate_secret(
-        pool,
-        prefix,
-        hash_secret(&replacement_secret),
-        &ctx.org_uuids(),
+    let path = format!(
+        "/v1/keys/{}/rotate?org_id={}",
+        encode_query_value(key_id),
+        encode_query_value(&org_id)
+    );
+    let (status, body) = match auth_json(
+        &config,
+        &headers,
+        reqwest::Method::POST,
+        &path,
+        Some(json!({})),
     )
     .await
     {
-        Ok(Some(_row)) => {}
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "ok": false, "error": "key_not_found" })),
-            )
-                .into_response();
-        }
-        Err(err) => return dependency_error("postgres", "api_key_rotate_failed", err),
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    if !status.is_success() {
+        return proxied_auth_error(status, body);
     }
+    let response: AuthKeyRotateResponse = match serde_json::from_value(body) {
+        Ok(response) => response,
+        Err(error) => {
+            return dependency_error("fiducia-auth", "auth_key_rotate_bad_response", error)
+        }
+    };
+    let display = match auth_key_to_display(&response.key) {
+        Ok(display) => display,
+        Err(error) => {
+            return dependency_error("fiducia-auth", "auth_key_rotate_bad_response", error)
+        }
+    };
 
     (
         StatusCode::OK,
+        [(header::CACHE_CONTROL, "no-store")],
         Json(json!({
             "ok": true,
             "prefix": prefix,
-            "rotated_at_ms": issued_at_ms,
-            "replacement_secret": replacement_secret,
-            "overlap_seconds": 0,
+            "rotated_at_ms": unix_epoch_ms(),
+            "replacement_secret": response.api_key,
+            "api_key": display,
+            "overlap_seconds": response.overlap_seconds,
         })),
     )
         .into_response()
 }
 
-/// The @fiducia/sync write path, generic in `{table}` (only `api_keys` is DB-wired
-/// today). Persists the queued optimistic write and returns the committed row
-/// version (a shared `WriteAck`) so the client adopts it and clears `dirty`.
-/// Other clients reconcile through tenant-scoped catch-up or Supabase RLS.
-async fn sync_write(
+async fn revoke_customer_api_key(
     State(config): State<AppConfig>,
-    Path(table): Path<String>,
     headers: HeaderMap,
-    Json(req): Json<SyncWriteRequest>,
+    Json(payload): Json<RevokeCustomerApiKeyRequest>,
 ) -> Response {
-    // Authenticate before any state read/write: the sync path is a row-mutating
-    // surface and was previously an unauthenticated IDOR into api_keys.
     let ctx = match config.authenticator.authenticate(&headers).await {
-        Ok(c) => c,
-        Err(e) => return e,
+        Ok(ctx) => ctx,
+        Err(response) => return response,
     };
-    if table != "api_keys" {
+    let prefix = payload.prefix.trim();
+    let Some(key_id) = auth_key_id_from_prefix(prefix) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_key_prefix", "ok": false })),
+        )
+            .into_response();
+    };
+    let org_id = match selected_customer_org(&ctx, &headers) {
+        Ok(org_id) => org_id,
+        Err(response) => return response,
+    };
+    let path = format!(
+        "/v1/keys/{}?org_id={}",
+        encode_query_value(key_id),
+        encode_query_value(&org_id)
+    );
+    let (status, body) =
+        match auth_json(&config, &headers, reqwest::Method::DELETE, &path, None).await {
+            Ok(result) => result,
+            Err(response) => return response,
+        };
+    if !status.is_success() {
+        return proxied_auth_error(status, body);
+    }
+    let response: AuthKeyRevokeResponse = match serde_json::from_value(body) {
+        Ok(response) => response,
+        Err(error) => {
+            return dependency_error("fiducia-auth", "auth_key_revoke_bad_response", error)
+        }
+    };
+    if !response.revoked {
         return (
             StatusCode::NOT_FOUND,
-            Json(json!({ "ok": false, "error": "unsupported_sync_table", "table": table })),
+            Json(json!({ "ok": false, "error": "key_not_found" })),
         )
             .into_response();
     }
-    // Idempotency: replay the original ack for a retried key instead of re-running
-    // the UPDATE (whose trigger would re-bump `version`). Matches the client's
-    // stable `Idempotency-Key: table:id:op:base_version`.
-    let idem_key = headers
-        .get("idempotency-key")
-        .and_then(|v| v.to_str().ok())
-        .map(|key| scoped_idempotency_key(&ctx, &table, key, &req));
-    if let Some(key) = &idem_key {
-        match idempotency_begin(&config, key).await {
-            Ok(Idem::Replay(v)) => return ack(&req.id, v).into_response(),
-            Ok(Idem::InFlight) => {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(json!({ "ok": false, "error": "idempotency_in_flight" })),
-                )
-                    .into_response()
-            }
-            Ok(Idem::Proceed) => {}
-            Err(err) => return dependency_error("postgres", "idempotency_claim_failed", err),
-        }
-    }
-
-    // Scoped to the caller's org so a client can only mutate its own rows.
-    let version = sync_write_api_keys_row(&config, &req, &ctx).await;
-    let version = match version {
-        Ok(version) => version,
-        Err(error) => {
-            if let Some(key) = &idem_key {
-                if let Err(release_error) = idempotency_release(&config, key).await {
-                    tracing::error!(error = %release_error, "failed to release unsuccessful idempotency claim");
-                }
-            }
-            match error {
-                SyncMutationError::InvalidId => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({ "ok": false, "error": "invalid_row_id" })),
-                    )
-                        .into_response()
-                }
-                SyncMutationError::NoOrg => {
-                    return (
-                        StatusCode::FORBIDDEN,
-                        Json(json!({ "ok": false, "error": "no_org_membership" })),
-                    )
-                        .into_response()
-                }
-                SyncMutationError::NotFound => {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(json!({ "ok": false, "error": "row_not_found" })),
-                    )
-                        .into_response()
-                }
-                SyncMutationError::Database(err) => {
-                    return dependency_error("postgres", "sync_write_failed", err)
-                }
-            }
-        }
-    };
-
-    if let Some(key) = &idem_key {
-        if let Err(err) = idempotency_commit(&config, key, version).await {
-            return dependency_error("postgres", "idempotency_commit_failed", err);
-        }
-    }
-    ack(&req.id, version).into_response()
-}
-
-/// Namespace client-provided idempotency keys by authenticated identity, org set,
-/// endpoint, and request body. The database never stores attacker-controlled key
-/// text directly, and one tenant cannot claim another tenant's retry key.
-fn scoped_idempotency_key(
-    ctx: &CustomerCtx,
-    table: &str,
-    client_key: &str,
-    request: &SyncWriteRequest,
-) -> String {
-    use sha2::{Digest, Sha256};
-
-    let mut orgs = ctx.orgs.clone();
-    orgs.sort();
-    orgs.dedup();
-    let request_json = serde_json::to_vec(request).unwrap_or_default();
-    let mut digest = Sha256::new();
-    digest.update(client_key.as_bytes());
-    digest.update([0]);
-    digest.update(request_json);
-    format!(
-        "v2:{}:{}:{table}:{:x}",
-        ctx.user_id,
-        orgs.join(","),
-        digest.finalize()
-    )
-}
-
-/// Idempotency decision for a claimed/seen key.
-enum Idem {
-    /// A previously-committed write — replay this version.
-    Replay(i64),
-    /// A concurrent claim is still in-flight — do not re-run.
-    InFlight,
-    /// We own the durable key — run the mutation.
-    Proceed,
-}
-
-/// Begin idempotent handling of `key` in the durable ledger.
-async fn idempotency_begin(config: &AppConfig, key: &str) -> Result<Idem, sqlx::Error> {
-    let pool = config.pool.as_ref().ok_or(sqlx::Error::PoolClosed)?;
-    if store::idem_claim(pool, key).await? {
-        return Ok(Idem::Proceed);
-    }
-    Ok(match store::idem_committed(pool, key).await? {
-        Some(Some(version)) => Idem::Replay(version),
-        Some(None) => Idem::InFlight,
-        None => Idem::InFlight,
-    })
-}
-
-/// Record the committed version for `key` in the durable ledger.
-async fn idempotency_commit(
-    config: &AppConfig,
-    key: &str,
-    version: i64,
-) -> Result<(), sqlx::Error> {
-    let pool = config.pool.as_ref().ok_or(sqlx::Error::PoolClosed)?;
-    store::idem_record(pool, key, version).await
-}
-
-/// Release a claim when the protected mutation did not commit. Stale in-flight
-/// claims are also recoverable in the store, covering process crashes.
-async fn idempotency_release(config: &AppConfig, key: &str) -> Result<(), sqlx::Error> {
-    let pool = config.pool.as_ref().ok_or(sqlx::Error::PoolClosed)?;
-    store::idem_release(pool, key).await
+    Json(json!({ "ok": true, "prefix": prefix, "status": "revoked" })).into_response()
 }
 
 #[derive(Debug, Deserialize)]
 struct CatchupParams {
-    /// Return rows with `version` strictly greater than this cursor (default 0).
+    /// Accepted for client compatibility and observability. API-key hydration is
+    /// a full authoritative snapshot because fiducia-auth owns the key store.
     #[serde(default)]
     since: i64,
 }
 
-/// Catch-up hydration: `GET /api/customer/sync/{table}?since=<version>` returns the
-/// authoritative rows newer than the client's cursor (org-scoped, ordered by
-/// version, index-backed) so anything missed while offline reconciles. Feeds the
-/// SDK's `hydrate()`.
+/// Catch-up hydration returns a complete, sanitized, org-scoped API-key snapshot
+/// from fiducia-auth. The browser uses `hydrate(..., { prune: true })`, so rows
+/// removed or revoked while it was offline reconcile without raw database CDC.
 async fn sync_catchup(
     State(config): State<AppConfig>,
     Path(table): Path<String>,
@@ -682,17 +778,34 @@ async fn sync_catchup(
     };
     let rows: Vec<serde_json::Value> = match table.as_str() {
         "api_keys" => {
-            let pool = match customer_pool(&config) {
-                Ok(pool) => pool,
+            let org_id = match selected_customer_org(&ctx, &headers) {
+                Ok(org_id) => org_id,
                 Err(response) => return response,
             };
-            let orgs = ctx.org_uuids();
-            if orgs.is_empty() {
-                vec![]
-            } else {
-                match store::catchup_api_keys(pool, &orgs, params.since, 500).await {
-                    Ok(rows) => rows.iter().map(api_key_row_to_display).collect(),
-                    Err(err) => return dependency_error("postgres", "sync_catchup_failed", err),
+            let path = format!("/v1/keys?org_id={}", encode_query_value(&org_id));
+            let (status, body) =
+                match auth_json(&config, &headers, reqwest::Method::GET, &path, None).await {
+                    Ok(result) => result,
+                    Err(response) => return response,
+                };
+            if !status.is_success() {
+                return proxied_auth_error(status, body);
+            }
+            let response: AuthKeyListResponse = match serde_json::from_value(body) {
+                Ok(response) => response,
+                Err(error) => {
+                    return dependency_error("fiducia-auth", "auth_key_list_bad_response", error)
+                }
+            };
+            match response
+                .keys
+                .iter()
+                .map(auth_key_to_display)
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(keys) => keys,
+                Err(error) => {
+                    return dependency_error("fiducia-auth", "auth_key_list_bad_response", error)
                 }
             }
         }
@@ -704,135 +817,13 @@ async fn sync_catchup(
                 .into_response()
         }
     };
-    Json(json!({ "table": table, "since": params.since, "rows": rows })).into_response()
-}
-
-/// Build the shared write-ack the @fiducia/sync client reconciles against.
-fn ack(id: &str, committed_version: i64) -> (StatusCode, Json<WriteAck>) {
-    (
-        StatusCode::OK,
-        Json(WriteAck {
-            id: id.to_string(),
-            committed_version,
-        }),
-    )
-}
-
-/// Persist one queued optimistic write to `api_keys`. Returns the committed row
-/// version or a concrete error.
-enum SyncMutationError {
-    InvalidId,
-    NoOrg,
-    NotFound,
-    Database(sqlx::Error),
-}
-
-async fn sync_write_api_keys_row(
-    config: &AppConfig,
-    req: &SyncWriteRequest,
-    ctx: &CustomerCtx,
-) -> Result<i64, SyncMutationError> {
-    let pool = config
-        .pool
-        .as_ref()
-        .ok_or(SyncMutationError::Database(sqlx::Error::PoolClosed))?;
-    let id = Uuid::parse_str(&req.id).map_err(|_| SyncMutationError::InvalidId)?;
-    let op = req.op.as_deref().unwrap_or("upsert");
-    // Every mutation is scoped to the caller's org(s); a row in another tenant's
-    // org yields no match (Option::None), so this is not a cross-tenant IDOR.
-    let orgs = ctx.org_uuids();
-    if orgs.is_empty() {
-        return Err(SyncMutationError::NoOrg);
-    }
-
-    let committed = if op == "delete" {
-        // A delete on a revocable credential is a soft revoke, not a row drop, so
-        // audit/history stay intact. Version still bumps.
-        store::soft_delete(pool, id, &orgs).await
-    } else {
-        let payload = req.payload.clone().unwrap_or_else(|| json!({}));
-        let revoked = match payload.get("status").and_then(|v| v.as_str()) {
-            Some("revoked") => Some(true),
-            Some(_) => Some(false),
-            None => payload.get("revoked").and_then(|v| v.as_bool()),
-        };
-        let patch = store::ApiKeyPatch {
-            name: payload
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned),
-            scopes: payload_scopes(&payload),
-            env: payload
-                .get("environment")
-                .and_then(|v| v.as_str())
-                .or_else(|| payload.get("env").and_then(|v| v.as_str()))
-                .map(str::to_owned),
-            revoked,
-        };
-        // COALESCE keeps existing values for any field the client omitted; the
-        // trigger bumps version + updated_at on the UPDATE.
-        store::upsert_fields(pool, id, &orgs, patch).await
-    };
-
-    match committed {
-        Ok(Some(row)) => Ok(row.version),
-        Ok(None) => Err(SyncMutationError::NotFound),
-        Err(err) => Err(SyncMutationError::Database(err)),
-    }
-}
-
-/// SHA-256 of an API-key secret. Only the hash is ever persisted — the plaintext
-/// secret is shown to the caller once and never stored.
-fn hash_secret(secret: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(secret.as_bytes());
-    format!("sha256:{digest:x}")
-}
-
-/// Normalize a client `scopes` field to a jsonb array, or `None` to leave it
-/// untouched. The display row stores scopes as a comma string; the column is an
-/// array — accept either shape.
-fn payload_scopes(payload: &serde_json::Value) -> Option<serde_json::Value> {
-    match payload.get("scopes") {
-        Some(serde_json::Value::Array(items)) => Some(serde_json::Value::Array(items.clone())),
-        Some(serde_json::Value::String(csv)) => {
-            let items: Vec<serde_json::Value> = csv
-                .split(',')
-                .map(|part| part.trim())
-                .filter(|part| !part.is_empty())
-                .map(|part| json!(part))
-                .collect();
-            Some(json!(items))
-        }
-        _ => None,
-    }
-}
-
-/// Map a DB row to the display shape the frontend renders (and stores in
-/// IndexedDB). `prefix` is the public `key_id`; scopes collapse to a comma string.
-fn api_key_row_to_display(row: &ApiKeysRow) -> serde_json::Value {
-    let scopes = row
-        .scopes
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|v| v.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_default();
-
-    json!({
-        "id": row.id.to_string(),
-        "name": row.name,
-        "prefix": row.key_id,
-        "scopes": scopes,
-        "last_used": if row.last_used_at.is_some() { "recently" } else { "never" },
-        "status": if row.revoked { "revoked" } else { "active" },
-        "environment": row.env,
-        "version": row.version,
-    })
+    Json(json!({
+        "table": table,
+        "snapshot": true,
+        "requested_since": params.since,
+        "rows": rows,
+    }))
+    .into_response()
 }
 
 /// Resolve the caller's local `users.id`, provisioning the row on first access.
@@ -989,7 +980,7 @@ async fn customer_security_sessions_json(
         Ok(rows) => rows.iter().map(session_model_json).collect::<Vec<_>>(),
         Err(err) => return dependency_error("postgres", "sessions_list_failed", err),
     };
-    Json(json!({ "sessions": sessions_json, "revoke_supported": false })).into_response()
+    Json(json!({ "sessions": sessions_json, "revoke_supported": true })).into_response()
 }
 
 async fn revoke_customer_security_session(
@@ -997,9 +988,10 @@ async fn revoke_customer_security_session(
     headers: HeaderMap,
     Json(payload): Json<RevokeCustomerSecuritySessionRequest>,
 ) -> Response {
-    if let Err(response) = config.authenticator.authenticate(&headers).await {
-        return response;
-    }
+    let ctx = match config.authenticator.authenticate(&headers).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
     let device = payload.device.trim();
     if device.is_empty() {
         return (
@@ -1009,15 +1001,20 @@ async fn revoke_customer_security_session(
             .into_response();
     }
 
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "ok": false,
-            "error": "provider_session_revocation_not_configured",
-            "device": device,
-        })),
-    )
-        .into_response()
+    let uid = match caller_user_id(&config, &ctx).await {
+        Ok(uid) => uid,
+        Err(response) => return response,
+    };
+    let pool = match customer_pool(&config) {
+        Ok(pool) => pool,
+        Err(response) => return response,
+    };
+    match store::revoke_session(pool, uid, device).await {
+        Ok(revoked) => {
+            Json(json!({ "ok": true, "device": device, "revoked": revoked })).into_response()
+        }
+        Err(err) => dependency_error("postgres", "session_revoke_failed", err),
+    }
 }
 
 fn validate_api_key_request(payload: &CreateCustomerApiKeyRequest) -> Option<&'static str> {
@@ -1095,40 +1092,8 @@ async fn customer_settings(State(config): State<AppConfig>) -> Markup {
     customer_page(&config, CustomerTab::Settings)
 }
 
-async fn customer_locks(State(config): State<AppConfig>) -> Markup {
-    customer_page(&config, CustomerTab::Locks)
-}
-
-async fn customer_requests(State(config): State<AppConfig>) -> Markup {
-    customer_page(&config, CustomerTab::Requests)
-}
-
-async fn customer_kv(State(config): State<AppConfig>) -> Markup {
-    customer_page(&config, CustomerTab::Kv)
-}
-
-async fn customer_services(State(config): State<AppConfig>) -> Markup {
-    customer_page(&config, CustomerTab::Services)
-}
-
 async fn summary_fragment() -> Markup {
     summary_markup()
-}
-
-async fn locks_fragment() -> Markup {
-    locks_markup()
-}
-
-async fn requests_fragment() -> Markup {
-    requests_markup()
-}
-
-async fn kv_fragment() -> Markup {
-    kv_markup()
-}
-
-async fn services_fragment() -> Markup {
-    services_markup()
 }
 
 async fn customer_ws(ws: WebSocketUpgrade) -> Response {
@@ -1210,13 +1175,7 @@ fn stream_payload(kind: &str, sequence: u64, transport: &str) -> serde_json::Val
         "transport": transport,
         "event": "fiducia:refresh",
         "at_ms": unix_epoch_ms(),
-        "fragments": {
-            "summary": summary_markup().into_string(),
-            "locks": locks_markup().into_string(),
-            "requests": requests_markup().into_string(),
-            "kv": kv_markup().into_string(),
-            "services": services_markup().into_string(),
-        },
+        "fragments": { "summary": summary_markup().into_string() },
     })
 }
 
@@ -1225,20 +1184,6 @@ fn unix_epoch_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
-}
-
-/// Hex-encoded CSPRNG token for API-key secrets. The plaintext is returned once;
-/// only its hash is persisted in customer Postgres.
-fn random_token_hex(bytes: usize) -> String {
-    let mut buf = vec![0u8; bytes];
-    // getrandom only fails if the OS entropy source is unavailable; treat that
-    // as fatal for a secret rather than falling back to a weak value.
-    getrandom::getrandom(&mut buf).expect("OS CSPRNG unavailable");
-    let mut out = String::with_capacity(bytes * 2);
-    for b in buf {
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
 }
 
 fn should_serve_customer_app(config: &AppConfig, headers: &HeaderMap) -> bool {
@@ -1260,24 +1205,16 @@ enum CustomerTab {
     ApiKeys,
     Security,
     Settings,
-    Locks,
-    Requests,
-    Kv,
-    Services,
 }
 
 impl CustomerTab {
-    fn all() -> [CustomerTab; 9] {
+    fn all() -> [CustomerTab; 5] {
         [
             CustomerTab::Dashboard,
             CustomerTab::Auth,
             CustomerTab::ApiKeys,
             CustomerTab::Security,
             CustomerTab::Settings,
-            CustomerTab::Locks,
-            CustomerTab::Requests,
-            CustomerTab::Kv,
-            CustomerTab::Services,
         ]
     }
 
@@ -1288,10 +1225,6 @@ impl CustomerTab {
             CustomerTab::ApiKeys => "/app/api-keys",
             CustomerTab::Security => "/app/security",
             CustomerTab::Settings => "/app/settings",
-            CustomerTab::Locks => "/app/locks",
-            CustomerTab::Requests => "/app/requests",
-            CustomerTab::Kv => "/app/kv",
-            CustomerTab::Services => "/app/services",
         }
     }
 
@@ -1302,38 +1235,36 @@ impl CustomerTab {
             CustomerTab::ApiKeys => "API Keys",
             CustomerTab::Security => "Security",
             CustomerTab::Settings => "Settings",
-            CustomerTab::Locks => "Locks",
-            CustomerTab::Requests => "Requests",
-            CustomerTab::Kv => "Config KV",
-            CustomerTab::Services => "Services",
         }
     }
 
     fn count(self) -> &'static str {
         match self {
-            CustomerTab::Dashboard => "12",
-            CustomerTab::Auth => "2",
-            CustomerTab::ApiKeys => "3",
+            CustomerTab::Dashboard => "home",
+            CustomerTab::Auth => "identity",
+            CustomerTab::ApiKeys => "access",
             CustomerTab::Security => "2FA",
-            CustomerTab::Settings => "8",
-            CustomerTab::Locks => "4",
-            CustomerTab::Requests => "6",
-            CustomerTab::Kv => "3",
-            CustomerTab::Services => "5",
+            CustomerTab::Settings => "profile",
         }
     }
 
     fn description(self) -> &'static str {
         match self {
-            CustomerTab::Dashboard => "Account posture, API access, realtime health, and customer operations in one workspace.",
-            CustomerTab::Auth => "Supabase Auth login, signup, magic link, and session controls for end customers.",
-            CustomerTab::ApiKeys => "Create, rotate, scope, and audit customer API keys for production integrations.",
-            CustomerTab::Security => "Two-factor authentication, trusted sessions, recovery, and account protection.",
-            CustomerTab::Settings => "Preferences, notifications, default region, and team-level customer settings.",
-            CustomerTab::Locks => "Live distributed lock state, fencing tokens, and wait queues.",
-            CustomerTab::Requests => "Recent mutating requests, routing outcomes, idempotency posture, and leader decisions.",
-            CustomerTab::Kv => "Configuration KV revisions, TTL status, and regional consistency.",
-            CustomerTab::Services => "Service discovery registrations, leader health, and instance counts.",
+            CustomerTab::Dashboard => {
+                "Account posture, API access, preferences, and customer security in one workspace."
+            }
+            CustomerTab::Auth => {
+                "Supabase Auth login, signup, magic link, and session controls for end customers."
+            }
+            CustomerTab::ApiKeys => {
+                "Create, rotate, scope, and audit customer API keys for production integrations."
+            }
+            CustomerTab::Security => {
+                "Two-factor authentication, trusted sessions, recovery, and account protection."
+            }
+            CustomerTab::Settings => {
+                "Preferences, notifications, default region, and team-level customer settings."
+            }
         }
     }
 }
@@ -1362,7 +1293,7 @@ fn customer_page(config: &AppConfig, active: CustomerTab) -> Markup {
                         div class="topbar__status" {
                             span class="status-pill" data-backend-stream-status="" data-status="connecting" { "connecting" }
                             span class="status-pill" data-supabase-status="" data-status="offline" { "offline" }
-                            span class="status-pill" { "linearizable reads" }
+                            span class="status-pill" { "customer app" }
                         }
                     }
                     main class="workspace" {
@@ -1444,29 +1375,6 @@ fn customer_tab_content(config: &AppConfig, active: CustomerTab) -> Markup {
         CustomerTab::ApiKeys => api_keys_markup(),
         CustomerTab::Security => security_markup(),
         CustomerTab::Settings => settings_markup(),
-        CustomerTab::Locks => html! {
-            div class="panel-grid" {
-                section id="locks-panel" class="panel" hx-get="/app/fragments/locks" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
-                    (locks_markup())
-                }
-                (realtime_events_markup())
-            }
-        },
-        CustomerTab::Requests => html! {
-            section id="requests-panel" class="panel" hx-get="/app/fragments/requests" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
-                (requests_markup())
-            }
-        },
-        CustomerTab::Kv => html! {
-            section id="kv-panel" class="panel" hx-get="/app/fragments/kv" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
-                (kv_markup())
-            }
-        },
-        CustomerTab::Services => html! {
-            section id="services-panel" class="panel" hx-get="/app/fragments/services" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
-                (services_markup())
-            }
-        },
     }
 }
 
@@ -1480,21 +1388,6 @@ fn dashboard_markup(config: &AppConfig) -> Markup {
             (api_key_summary_panel())
             (security_summary_panel())
             (preferences_summary_panel())
-        }
-        div class="panel-grid" {
-            section id="locks-panel" class="panel" hx-get="/app/fragments/locks" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
-                (locks_markup())
-            }
-            (realtime_events_markup())
-        }
-        section id="requests-panel" class="panel" hx-get="/app/fragments/requests" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
-            (requests_markup())
-        }
-        section id="kv-panel" class="panel" hx-get="/app/fragments/kv" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
-            (kv_markup())
-        }
-        section id="services-panel" class="panel" hx-get="/app/fragments/services" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
-            (services_markup())
         }
     }
 }
@@ -1547,7 +1440,7 @@ fn api_key_summary_panel() -> Markup {
                     }
                     div {
                         dt { "Rotation" }
-                        dd { "rotation invalidates the previous secret immediately" }
+                        dd { "rotation reports the remaining edge/LB cache overlap" }
                     }
                 }
                 a class="button-link" href="/app/api-keys" { "Manage keys" }
@@ -1740,7 +1633,7 @@ fn api_keys_markup() -> Markup {
         section class="panel" aria-labelledby="api-keys-heading" {
             div class="panel__header" {
                 h2 id="api-keys-heading" { "Customer API keys" }
-                span { "immediate rotation" }
+                span { "bounded rotation overlap" }
             }
             div class="table-wrap" {
                 table data-api-keys-table="" {
@@ -1937,27 +1830,13 @@ fn settings_markup() -> Markup {
     }
 }
 
-fn realtime_events_markup() -> Markup {
-    html! {
-        section class="panel" aria-labelledby="events-heading" {
-            div class="panel__header" {
-                h2 id="events-heading" { "Realtime Events" }
-                span { "Supabase" }
-            }
-            div id="realtime-events" class="event-stream" aria-live="polite" {
-                div class="empty-state" { "Waiting for realtime changes." }
-            }
-        }
-    }
-}
-
 fn summary_markup() -> Markup {
     html! {
         div class="summary-grid" {
             div class="metric" {
                 p class="metric__label" { "API keys" }
                 p class="metric__value" { "live" }
-                p class="metric__hint" { "loaded from customer PostgreSQL after sign-in" }
+                p class="metric__hint" { "sanitized metadata from fiducia-auth after sign-in" }
             }
             div class="metric" {
                 p class="metric__label" { "Preferences" }
@@ -1970,58 +1849,10 @@ fn summary_markup() -> Markup {
                 p class="metric__hint" { "trusted sessions from customer PostgreSQL" }
             }
             div class="metric" {
-                p class="metric__label" { "Coordination telemetry" }
-                p class="metric__value" { "scoped" }
-                p class="metric__hint" { "hidden until node observability is tenant-aware" }
+                p class="metric__label" { "Application boundary" }
+                p class="metric__value" { "customer" }
+                p class="metric__hint" { "operator infrastructure controls live only in the admin app" }
             }
-        }
-    }
-}
-
-fn locks_markup() -> Markup {
-    html! {
-        div class="panel__header" {
-            h2 { "Locks" }
-            span { "unavailable" }
-        }
-        div class="empty-state" {
-            "Lock inventory is not shown because the node observability API is cluster-wide, not customer-scoped."
-        }
-    }
-}
-
-fn requests_markup() -> Markup {
-    html! {
-        div class="panel__header" {
-            h2 { "Requests" }
-            span { "unavailable" }
-        }
-        div class="empty-state" {
-            "Per-request telemetry requires a customer-scoped audit source; invented request samples are never displayed."
-        }
-    }
-}
-
-fn kv_markup() -> Markup {
-    html! {
-        div class="panel__header" {
-            h2 { "Config KV" }
-            span { "unavailable" }
-        }
-        div class="empty-state" {
-            "KV inventory is hidden until the node can enforce an authenticated customer namespace."
-        }
-    }
-}
-
-fn services_markup() -> Markup {
-    html! {
-        div class="panel__header" {
-            h2 { "Service Discovery" }
-            span { "unavailable" }
-        }
-        div class="empty-state" {
-            "Service discovery is cluster-wide today and is not exposed as customer-owned data."
         }
     }
 }
@@ -2117,6 +1948,7 @@ mod tests {
             customer_site_mode: false,
             supabase_url: None,
             supabase_anon_key: None,
+            auth_url: None,
             pool: None,
             // Tests exercise the handlers as an authenticated customer with a
             // fixed org; production uses `Authenticator::from_env()` (fail-closed).
@@ -2171,14 +2003,10 @@ mod tests {
             .await,
             StatusCode::SERVICE_UNAVAILABLE
         );
+        // The catch-up endpoint is GET-only; mutation attempts never reach auth.
         assert_eq!(
-            post_json(
-                deny(),
-                "/api/customer/sync/api_keys",
-                r#"{"id":"x","op":"upsert"}"#
-            )
-            .await,
-            StatusCode::SERVICE_UNAVAILABLE
+            post_json(deny(), "/api/customer/sync/api_keys", "{}").await,
+            StatusCode::METHOD_NOT_ALLOWED
         );
     }
 
@@ -2443,10 +2271,11 @@ mod tests {
         assert!(body.contains("Login"));
         assert!(body.contains("Sign up"));
         assert!(body.contains("API Keys"));
-        assert!(body.contains("2FA ready"));
+        assert!(body.contains("2FA enrollment available"));
         assert!(body.contains("Preferences"));
-        assert!(body.contains("node observability API is cluster-wide"));
-        assert!(!body.contains("checkout:tenant-42"));
+        assert!(body.contains("operator infrastructure controls live only in the admin app"));
+        assert!(!body.contains("Config KV"));
+        assert!(!body.contains("Service Discovery"));
     }
 
     #[tokio::test]
@@ -2470,12 +2299,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn htmx_locks_fragment_is_rendered() {
-        let (status, ct, body) = send("/app/fragments/locks").await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(ct.contains("text/html"), "ct={ct}");
-        assert!(body.contains("not shown"));
-        assert!(!body.contains("checkout:tenant-42"));
+    async fn operator_pages_are_absent_from_the_customer_app() {
+        for uri in [
+            "/app/locks",
+            "/app/requests",
+            "/app/kv",
+            "/app/services",
+            "/app/fragments/locks",
+        ] {
+            let (status, _, body) = send(uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert!(body.contains("no quorum on this page"), "{uri}");
+            assert!(!body.contains("operator"), "{uri}");
+        }
     }
 
     #[tokio::test]
@@ -2499,60 +2335,20 @@ mod tests {
         assert!(ct.contains("text/event-stream"), "ct={ct}");
     }
 
-    async fn post_sync(config: AppConfig, key: Option<&str>, base: i64) -> serde_json::Value {
-        let app = build_router(config);
-        let mut builder = Request::builder()
-            .method("POST")
-            .uri("/api/customer/sync/api_keys")
-            .header(header::CONTENT_TYPE, "application/json");
-        if let Some(k) = key {
-            builder = builder.header("idempotency-key", k);
-        }
-        let body = json!({ "id": "k1", "op": "upsert", "base_version": base }).to_string();
-        let resp = app
-            .oneshot(builder.body(Body::from(body)).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        serde_json::from_slice(&bytes).unwrap()
-    }
-
     #[tokio::test]
-    async fn sync_write_requires_durable_storage_and_rejects_unknown_tables() {
-        let acked = post_sync(test_config(), None, 4).await;
-        assert_eq!(acked["error"], "sync_write_failed");
-
-        // A table with no implementation is rejected instead of acknowledging a
-        // write that was never persisted.
-        let app = build_router(test_config());
-        let resp = app
+    async fn customer_sync_is_read_only() {
+        let resp = build_router(test_config())
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/customer/sync/customer_preferences")
+                    .uri("/api/customer/sync/api_keys")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        json!({ "id": "p1", "base_version": 0 }).to_string(),
-                    ))
+                    .body(Body::from("{}"))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn sync_write_idempotency_requires_durable_ledger() {
-        let config = test_config();
-        let first = post_sync(config.clone(), Some("api_keys:k1:upsert:7"), 7).await;
-        assert_eq!(first["error"], "idempotency_claim_failed");
-        let retry = post_sync(config.clone(), Some("api_keys:k1:upsert:7"), 999).await;
-        assert_eq!(retry["error"], "idempotency_claim_failed");
-        let other = post_sync(config.clone(), Some("api_keys:k2:upsert:2"), 2).await;
-        assert_eq!(other["error"], "idempotency_claim_failed");
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
     #[tokio::test]
