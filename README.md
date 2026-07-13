@@ -128,3 +128,38 @@ the shared gateway under `/fiducia/`, mirroring `canonical.cloud`:
 Manifests live in [`ORESoftware/k8s-cluster`](https://github.com/ORESoftware/k8s-cluster)
 at `remote/argocd/dd-next-runtime/dd-fiducia-rs.*`; this repo is wired in as the
 `remote/deployments/fiducia-backend.rs` git submodule.
+
+## Security
+
+**Secure-by-default posture.** The customer authenticator is fail-closed
+(`Authenticator::Deny` when `FIDUCIA_AUTH_URL` is unset), so `/api/customer/*`
+never serves data without a verified Supabase session; writes are scoped to the
+caller's org (never "first org"). `FIDUCIA_SITE_MODE` defaults to the restricted
+host-based routing — the permissive `customer` mode must be set explicitly.
+There is no `FIDUCIA_ALLOW_INSECURE_*`/dev-session toggle; the only test-auth
+escape hatch (`FIDUCIA_E2E_STATIC_CUSTOMER_AUTH`) is compiled out of release
+builds.
+
+**Hardening in place.** All SQL is parameterized (`sqlx` `.bind`, no string
+concatenation). The middleware stack sets `X-Content-Type-Options: nosniff`,
+`X-Frame-Options: DENY`, a referrer policy, a permissions policy, and a CSP; it
+bounds request time (`TimeoutLayer`, 30s), caps bodies (`RequestBodyLimitLayer`,
+64 KiB), and catches handler panics (`CatchPanicLayer`). API-key secrets use the
+OS CSPRNG and only their hash is persisted. There is no permissive CORS layer.
+
+**Heartbeat no longer fans out customer rows.** A process-wide broadcast channel
+that placed `api_keys` change frames onto the public `/app/ws` + `/app/events`
+portal heartbeat has been removed. The heartbeat now carries only generic
+refresh frames; durable customer changes are loaded through authenticated,
+tenant-scoped catch-up APIs or Supabase RLS subscriptions.
+
+**Accepted advisories** (no clean in-semver fix; recorded rather than force-fixed):
+
+- `rsa` [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071) —
+  Marvin timing side-channel. Transitive (via `sqlx`'s MySQL path, unused here);
+  no fixed upgrade is published.
+- `proc-macro-error` [RUSTSEC-2024-0370](https://rustsec.org/advisories/RUSTSEC-2024-0370)
+  and `proc-macro-error2` [RUSTSEC-2026-0173](https://rustsec.org/advisories/RUSTSEC-2026-0173)
+  — unmaintained. Build-time proc-macro deps only; no runtime exposure.
+
+Run `cargo audit` to re-check. These three are the only known findings.

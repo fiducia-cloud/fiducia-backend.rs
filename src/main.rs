@@ -556,30 +556,30 @@ async fn sync_write(
                 }
             }
             match error {
-        SyncMutationError::InvalidId => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "ok": false, "error": "invalid_row_id" })),
-            )
-                .into_response()
-        }
-        SyncMutationError::NoOrg => {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({ "ok": false, "error": "no_org_membership" })),
-            )
-                .into_response()
-        }
-        SyncMutationError::NotFound => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "ok": false, "error": "row_not_found" })),
-            )
-                .into_response()
-        }
-        SyncMutationError::Database(err) => {
-            return dependency_error("postgres", "sync_write_failed", err)
-        }
+                SyncMutationError::InvalidId => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "ok": false, "error": "invalid_row_id" })),
+                    )
+                        .into_response()
+                }
+                SyncMutationError::NoOrg => {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({ "ok": false, "error": "no_org_membership" })),
+                    )
+                        .into_response()
+                }
+                SyncMutationError::NotFound => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({ "ok": false, "error": "row_not_found" })),
+                    )
+                        .into_response()
+                }
+                SyncMutationError::Database(err) => {
+                    return dependency_error("postgres", "sync_write_failed", err)
+                }
             }
         }
     };
@@ -611,7 +611,12 @@ fn scoped_idempotency_key(
     digest.update(client_key.as_bytes());
     digest.update([0]);
     digest.update(request_json);
-    format!("v2:{}:{}:{table}:{:x}", ctx.user_id, orgs.join(","), digest.finalize())
+    format!(
+        "v2:{}:{}:{table}:{:x}",
+        ctx.user_id,
+        orgs.join(","),
+        digest.finalize()
+    )
 }
 
 /// Idempotency decision for a claimed/seen key.

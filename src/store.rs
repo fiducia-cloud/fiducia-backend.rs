@@ -219,12 +219,10 @@ pub async fn idem_claim(pool: &PgPool, key: &str) -> Result<bool, sqlx::Error> {
 /// Release an unsuccessful in-flight claim. A committed replay record is never
 /// deleted by this path.
 pub async fn idem_release(pool: &PgPool, key: &str) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "delete from sync_idempotency_keys where key = $1 and committed_version is null",
-    )
-    .bind(key)
-    .execute(pool)
-    .await?;
+    sqlx::query("delete from sync_idempotency_keys where key = $1 and committed_version is null")
+        .bind(key)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -328,7 +326,10 @@ pub async fn upsert_preferences(
         am.notify_key_rotation = Set(notify_key_rotation);
         am.notify_lock_contention = Set(notify_lock_contention);
         am.notify_mfa = Set(notify_mfa);
-        am.update(&conn).await.map_err(map_err).map(prefs::Model::into_row)
+        am.update(&conn)
+            .await
+            .map_err(map_err)
+            .map(prefs::Model::into_row)
     } else {
         prefs::ActiveModel {
             user_id: Set(user_id),
