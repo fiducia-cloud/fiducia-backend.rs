@@ -18,19 +18,54 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 
+const fn customer_session_cookie_name(release_hardened: bool) -> &'static str {
+    if release_hardened {
+        "__Host-fiducia_customer_session"
+    } else {
+        "fiducia_customer_session"
+    }
+}
+
+const fn customer_login_csrf_cookie_name(release_hardened: bool) -> &'static str {
+    if release_hardened {
+        "__Host-fiducia_customer_login_csrf"
+    } else {
+        "fiducia_customer_login_csrf"
+    }
+}
+
+/// Release cookies use the browser-enforced `__Host-` prefix, preventing a
+/// sibling subdomain from planting a colliding Domain cookie. Debug builds use
+/// unprefixed names so explicitly enabled loopback HTTP remains usable.
+pub const CUSTOMER_SESSION_COOKIE: &str = customer_session_cookie_name(!cfg!(debug_assertions));
+pub const CUSTOMER_LOGIN_CSRF_COOKIE: &str =
+    customer_login_csrf_cookie_name(!cfg!(debug_assertions));
+
 /// A verified customer session — who is calling and which orgs they belong to.
 /// `user_id`/`email` are carried for audit/attribution; not every handler reads
 /// them yet.
 #[derive(Clone, Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct CustomerCtx {
-    #[serde(default)]
     pub user_id: String,
-    #[serde(default)]
     pub email: Option<String>,
     /// Orgs the user belongs to (admin-controlled claims; see fiducia-auth).
-    #[serde(default)]
     pub orgs: Vec<String>,
+    /// Opaque request-CSRF HMAC input. Never render or log this value.
+    #[serde(skip)]
+    pub(crate) credential_binding: String,
+    #[serde(skip)]
+    pub(crate) cookie_authenticated: bool,
+}
+
+impl CustomerCtx {
+    pub fn csrf_binding(&self) -> &str {
+        &self.credential_binding
+    }
+
+    pub fn is_browser_session(&self) -> bool {
+        self.cookie_authenticated || self.credential_binding.starts_with("development\0")
+    }
 }
 
 /// How a request is authenticated. Production verifies via fiducia-auth; tests
@@ -69,6 +104,8 @@ impl Authenticator {
                 user_id: "fiducia-e2e-customer".to_string(),
                 email: Some("customer-e2e@fiducia.invalid".to_string()),
                 orgs: vec!["00000000-0000-4000-8000-000000000001".to_string()],
+                credential_binding: "development\0fiducia-e2e-customer".to_string(),
+                cookie_authenticated: false,
             }));
         }
         match std::env::var("FIDUCIA_AUTH_URL")
@@ -90,16 +127,18 @@ impl Authenticator {
                 "customer_auth_not_configured",
             )),
             Authenticator::AuthService(url) => {
-                let bearer = headers
-                    .get(AUTHORIZATION)
-                    .and_then(|v| v.to_str().ok())
-                    .filter(|v| v.starts_with("Bearer "));
-                let Some(bearer) = bearer else {
-                    return Err(deny(StatusCode::UNAUTHORIZED, "missing_bearer_token"));
+                let credential = match presented_credential(headers) {
+                    CredentialSelection::Valid(credential) => credential,
+                    CredentialSelection::Missing => {
+                        return Err(deny(StatusCode::UNAUTHORIZED, "missing_customer_session"))
+                    }
+                    CredentialSelection::Invalid => {
+                        return Err(deny(StatusCode::UNAUTHORIZED, "invalid_customer_session"))
+                    }
                 };
                 let resp = http()
                     .get(format!("{url}/v1/me"))
-                    .header(AUTHORIZATION, bearer)
+                    .bearer_auth(&credential.token)
                     .send()
                     .await;
                 match resp {
@@ -108,19 +147,203 @@ impl Authenticator {
                             .json()
                             .await
                             .map_err(|_| deny(StatusCode::BAD_GATEWAY, "auth_bad_response"))?;
-                        let ctx: CustomerCtx = serde_json::from_value(
+                        let mut ctx: CustomerCtx = serde_json::from_value(
                             body.get("user").cloned().unwrap_or(serde_json::Value::Null),
                         )
                         .map_err(|_| deny(StatusCode::BAD_GATEWAY, "auth_bad_response"))?;
+                        if ctx.user_id.trim().is_empty() {
+                            return Err(deny(StatusCode::BAD_GATEWAY, "auth_bad_response"));
+                        }
                         if ctx.orgs.is_empty() {
                             return Err(deny(StatusCode::FORBIDDEN, "no_org_membership"));
                         }
+                        let credential_kind = if credential.cookie_authenticated {
+                            "cookie"
+                        } else {
+                            "authorization"
+                        };
+                        ctx.credential_binding = format!("{credential_kind}\0{}", credential.token);
+                        ctx.cookie_authenticated = credential.cookie_authenticated;
                         Ok(ctx)
                     }
-                    Ok(_) => Err(deny(StatusCode::UNAUTHORIZED, "invalid_or_expired_session")),
+                    Ok(r)
+                        if matches!(
+                            r.status(),
+                            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+                        ) =>
+                    {
+                        Err(deny(StatusCode::UNAUTHORIZED, "invalid_or_expired_session"))
+                    }
+                    Ok(_) => Err(deny(StatusCode::SERVICE_UNAVAILABLE, "auth_unavailable")),
                     Err(_) => Err(deny(StatusCode::SERVICE_UNAVAILABLE, "auth_unreachable")),
                 }
             }
         }
+    }
+}
+
+struct PresentedCredential {
+    token: String,
+    cookie_authenticated: bool,
+}
+
+enum CredentialSelection {
+    Missing,
+    Invalid,
+    Valid(PresentedCredential),
+}
+
+/// Explicit Authorization always wins and never downgrades to an ambient
+/// cookie. Duplicate/malformed bearer headers and duplicate canonical cookies
+/// are invalid credentials, not an invitation to try another source.
+fn presented_credential(headers: &HeaderMap) -> CredentialSelection {
+    if headers.contains_key(AUTHORIZATION) {
+        return match authorization_token(headers) {
+            Some(token) => CredentialSelection::Valid(PresentedCredential {
+                token,
+                cookie_authenticated: false,
+            }),
+            None => CredentialSelection::Invalid,
+        };
+    }
+
+    if cookie_name_present(headers, CUSTOMER_SESSION_COOKIE) {
+        return match cookie_value(headers, CUSTOMER_SESSION_COOKIE) {
+            Some(token) => CredentialSelection::Valid(PresentedCredential {
+                token,
+                cookie_authenticated: true,
+            }),
+            None => CredentialSelection::Invalid,
+        };
+    }
+
+    CredentialSelection::Missing
+}
+
+pub fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    match presented_credential(headers) {
+        CredentialSelection::Valid(credential) => Some(credential.token),
+        CredentialSelection::Missing | CredentialSelection::Invalid => None,
+    }
+}
+
+pub(crate) fn cookie_value(headers: &HeaderMap, expected_name: &str) -> Option<String> {
+    let mut found = None;
+    for value in headers.get_all("cookie") {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        for part in value.split(';') {
+            let Some((name, value)) = part.trim().split_once('=') else {
+                continue;
+            };
+            if name == expected_name && !value.trim().is_empty() {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(value.trim().to_string());
+            }
+        }
+    }
+    found
+}
+
+fn cookie_name_present(headers: &HeaderMap, expected_name: &str) -> bool {
+    headers.get_all("cookie").iter().any(|value| {
+        value.to_str().is_ok_and(|value| {
+            value.split(';').any(|part| {
+                part.trim()
+                    .split_once('=')
+                    .is_some_and(|(name, _)| name == expected_name)
+            })
+        })
+    })
+}
+
+fn authorization_token(headers: &HeaderMap) -> Option<String> {
+    let mut values = headers.get_all(AUTHORIZATION).iter();
+    let value = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value
+        .strip_prefix("Bearer ")
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn customer_cookie_is_isolated_from_admin_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            format!("fiducia_admin_session=admin.jwt; {CUSTOMER_SESSION_COOKIE}=customer.jwt")
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(bearer_token(&headers).as_deref(), Some("customer.jwt"));
+
+        headers.insert("cookie", "fiducia_admin_session=admin.jwt".parse().unwrap());
+        assert_eq!(bearer_token(&headers), None);
+    }
+
+    #[test]
+    fn malformed_authorization_never_downgrades_to_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Basic not-a-bearer".parse().unwrap());
+        headers.insert(
+            "cookie",
+            format!("{CUSTOMER_SESSION_COOKIE}=ambient.jwt")
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(bearer_token(&headers), None);
+        assert!(matches!(
+            presented_credential(&headers),
+            CredentialSelection::Invalid
+        ));
+    }
+
+    #[test]
+    fn duplicate_authorization_headers_are_rejected() {
+        let mut headers = HeaderMap::new();
+        headers.append(AUTHORIZATION, "Bearer first.jwt".parse().unwrap());
+        headers.append(AUTHORIZATION, "Bearer second.jwt".parse().unwrap());
+        assert_eq!(bearer_token(&headers), None);
+    }
+
+    #[test]
+    fn duplicate_customer_cookies_are_rejected() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "cookie",
+            format!("{CUSTOMER_SESSION_COOKIE}=first.jwt")
+                .parse()
+                .unwrap(),
+        );
+        headers.append(
+            "cookie",
+            format!("{CUSTOMER_SESSION_COOKIE}=second.jwt")
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(bearer_token(&headers), None);
+    }
+
+    #[test]
+    fn release_cookie_names_are_host_only() {
+        assert_eq!(
+            customer_session_cookie_name(true),
+            "__Host-fiducia_customer_session"
+        );
+        assert_eq!(
+            customer_login_csrf_cookie_name(true),
+            "__Host-fiducia_customer_login_csrf"
+        );
+        assert!(!customer_session_cookie_name(false).starts_with("__Host-"));
     }
 }
