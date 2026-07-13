@@ -39,6 +39,7 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 const STREAM_HEARTBEAT_SECS: u64 = 15;
 const CUSTOMER_WS_PATH: &str = "/app/ws";
 const CUSTOMER_EVENTS_PATH: &str = "/app/events";
+const CUSTOMER_ORG_HEADER: &str = "x-fiducia-org-id";
 
 const CUSTOMER_REGIONS: &[&str] = &["auto", "iad1", "sfo1", "ams1", "fra1", "sin1", "syd1"];
 
@@ -147,6 +148,7 @@ fn build_router(config: AppConfig) -> Router {
         .route("/healthz", get(health))
         .route("/api/health", get(health))
         .route("/api/info", get(info))
+        .route("/api/customer/context", get(customer_context_json))
         .route(
             "/api/customer/api-keys",
             get(customer_api_keys_json).post(create_customer_api_key),
@@ -154,6 +156,10 @@ fn build_router(config: AppConfig) -> Router {
         .route(
             "/api/customer/api-keys/rotate",
             axum::routing::post(rotate_customer_api_key),
+        )
+        .route(
+            "/api/customer/api-keys/revoke",
+            axum::routing::post(revoke_customer_api_key),
         )
         // Read-only authenticated catch-up for local browser hydration. Credential
         // mutations go through the explicit create/rotate endpoints above and are
@@ -289,6 +295,11 @@ struct RotateCustomerApiKeyRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct RevokeCustomerApiKeyRequest {
+    prefix: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct AuthKeyMeta {
     key_id: String,
     name: String,
@@ -316,6 +327,11 @@ struct AuthKeyRotateResponse {
     api_key: String,
     key: AuthKeyMeta,
     overlap_seconds: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthKeyRevokeResponse {
+    revoked: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -358,14 +374,40 @@ fn dependency_error(dependency: &str, code: &str, error: impl std::fmt::Display)
 }
 
 #[allow(clippy::result_large_err)]
-fn selected_customer_org(ctx: &CustomerCtx) -> Result<&str, Response> {
+fn selected_customer_org(ctx: &CustomerCtx, headers: &HeaderMap) -> Result<String, Response> {
+    if let Some(requested) = headers.get(CUSTOMER_ORG_HEADER) {
+        let requested = requested.to_str().map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": "invalid_org_selection" })),
+            )
+                .into_response()
+        })?;
+        let requested = requested.trim();
+        if requested.is_empty() || requested.len() > 128 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": "invalid_org_selection" })),
+            )
+                .into_response());
+        }
+        if ctx.orgs.iter().any(|org_id| org_id == requested) {
+            return Ok(requested.to_string());
+        }
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "ok": false, "error": "forbidden_org" })),
+        )
+            .into_response());
+    }
+
     match ctx.orgs.as_slice() {
         [] => Err((
             StatusCode::FORBIDDEN,
             Json(json!({ "ok": false, "error": "no_org_membership" })),
         )
             .into_response()),
-        [org_id] => Ok(org_id),
+        [org_id] => Ok(org_id.clone()),
         _ => Err((
             StatusCode::BAD_REQUEST,
             Json(json!({ "ok": false, "error": "org_selection_required" })),
@@ -401,6 +443,9 @@ async fn auth_json(
     let mut request = reqwest::Client::new()
         .request(method, format!("{base}{path}"))
         .header(reqwest::header::AUTHORIZATION, bearer);
+    if let Some(idempotency_key) = headers.get("idempotency-key") {
+        request = request.header("idempotency-key", idempotency_key);
+    }
     if let Some(body) = body {
         request = request.json(&body);
     }
@@ -471,11 +516,11 @@ async fn customer_api_keys_json(State(config): State<AppConfig>, headers: Header
         Ok(c) => c,
         Err(e) => return e,
     };
-    let org_id = match selected_customer_org(&ctx) {
+    let org_id = match selected_customer_org(&ctx, &headers) {
         Ok(org_id) => org_id,
         Err(response) => return response,
     };
-    let path = format!("/v1/keys?org_id={}", encode_query_value(org_id));
+    let path = format!("/v1/keys?org_id={}", encode_query_value(&org_id));
     let (status, body) = match auth_json(&config, &headers, reqwest::Method::GET, &path, None).await
     {
         Ok(result) => result,
@@ -507,6 +552,21 @@ async fn customer_api_keys_json(State(config): State<AppConfig>, headers: Header
     .into_response()
 }
 
+async fn customer_context_json(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
+    let ctx = match config.authenticator.authenticate(&headers).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    Json(json!({
+        "user": {
+            "user_id": ctx.user_id,
+            "email": ctx.email,
+            "orgs": ctx.orgs,
+        }
+    }))
+    .into_response()
+}
+
 async fn create_customer_api_key(
     State(config): State<AppConfig>,
     headers: HeaderMap,
@@ -524,7 +584,7 @@ async fn create_customer_api_key(
             .into_response();
     };
 
-    let org_id = match selected_customer_org(&ctx) {
+    let org_id = match selected_customer_org(&ctx, &headers) {
         Ok(org_id) => org_id,
         Err(response) => return response,
     };
@@ -564,6 +624,7 @@ async fn create_customer_api_key(
     };
     (
         StatusCode::CREATED,
+        [(header::CACHE_CONTROL, "no-store")],
         Json(json!({
             "ok": true,
             "api_key": display,
@@ -592,14 +653,14 @@ async fn rotate_customer_api_key(
             .into_response();
     };
 
-    let org_id = match selected_customer_org(&ctx) {
+    let org_id = match selected_customer_org(&ctx, &headers) {
         Ok(org_id) => org_id,
         Err(response) => return response,
     };
     let path = format!(
         "/v1/keys/{}/rotate?org_id={}",
         encode_query_value(key_id),
-        encode_query_value(org_id)
+        encode_query_value(&org_id)
     );
     let (status, body) = match auth_json(
         &config,
@@ -631,6 +692,7 @@ async fn rotate_customer_api_key(
 
     (
         StatusCode::OK,
+        [(header::CACHE_CONTROL, "no-store")],
         Json(json!({
             "ok": true,
             "prefix": prefix,
@@ -641,6 +703,56 @@ async fn rotate_customer_api_key(
         })),
     )
         .into_response()
+}
+
+async fn revoke_customer_api_key(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Json(payload): Json<RevokeCustomerApiKeyRequest>,
+) -> Response {
+    let ctx = match config.authenticator.authenticate(&headers).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    let prefix = payload.prefix.trim();
+    let Some(key_id) = auth_key_id_from_prefix(prefix) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_key_prefix", "ok": false })),
+        )
+            .into_response();
+    };
+    let org_id = match selected_customer_org(&ctx, &headers) {
+        Ok(org_id) => org_id,
+        Err(response) => return response,
+    };
+    let path = format!(
+        "/v1/keys/{}?org_id={}",
+        encode_query_value(key_id),
+        encode_query_value(&org_id)
+    );
+    let (status, body) =
+        match auth_json(&config, &headers, reqwest::Method::DELETE, &path, None).await {
+            Ok(result) => result,
+            Err(response) => return response,
+        };
+    if !status.is_success() {
+        return proxied_auth_error(status, body);
+    }
+    let response: AuthKeyRevokeResponse = match serde_json::from_value(body) {
+        Ok(response) => response,
+        Err(error) => {
+            return dependency_error("fiducia-auth", "auth_key_revoke_bad_response", error)
+        }
+    };
+    if !response.revoked {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": "key_not_found" })),
+        )
+            .into_response();
+    }
+    Json(json!({ "ok": true, "prefix": prefix, "status": "revoked" })).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -666,11 +778,11 @@ async fn sync_catchup(
     };
     let rows: Vec<serde_json::Value> = match table.as_str() {
         "api_keys" => {
-            let org_id = match selected_customer_org(&ctx) {
+            let org_id = match selected_customer_org(&ctx, &headers) {
                 Ok(org_id) => org_id,
                 Err(response) => return response,
             };
-            let path = format!("/v1/keys?org_id={}", encode_query_value(org_id));
+            let path = format!("/v1/keys?org_id={}", encode_query_value(&org_id));
             let (status, body) =
                 match auth_json(&config, &headers, reqwest::Method::GET, &path, None).await {
                     Ok(result) => result,
