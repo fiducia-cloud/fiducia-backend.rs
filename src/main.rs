@@ -948,9 +948,10 @@ async fn revoke_customer_security_session(
     headers: HeaderMap,
     Json(payload): Json<RevokeCustomerSecuritySessionRequest>,
 ) -> Response {
-    if let Err(e) = config.authenticator.authenticate(&headers).await {
-        return e;
-    }
+    let ctx = match config.authenticator.authenticate(&headers).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
     let device = payload.device.trim();
     if device.is_empty() {
         return (
@@ -960,8 +961,18 @@ async fn revoke_customer_security_session(
             .into_response();
     }
 
-    let found = sessions().iter().any(|row| row.device == device);
-    if !found {
+    // Revoke the caller's own session by device; DB-backed when a pool is present.
+    let revoked = match (config.pool.as_ref(), caller_user_id(&config, &ctx).await) {
+        (Some(pool), Some(uid)) => match store::revoke_session(pool, uid, device).await {
+            Ok(found) => found,
+            Err(err) => {
+                tracing::error!("revoke_session failed: {err}");
+                false
+            }
+        },
+        _ => sessions().iter().any(|row| row.device == device),
+    };
+    if !revoked {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "session_not_found", "ok": false })),
