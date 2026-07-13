@@ -494,7 +494,7 @@ async fn rotate_customer_api_key(
             "prefix": prefix,
             "rotated_at_ms": issued_at_ms,
             "replacement_secret": replacement_secret,
-            "overlap_seconds": 900,
+            "overlap_seconds": 0,
         })),
     )
         .into_response()
@@ -989,7 +989,7 @@ async fn customer_security_sessions_json(
         Ok(rows) => rows.iter().map(session_model_json).collect::<Vec<_>>(),
         Err(err) => return dependency_error("postgres", "sessions_list_failed", err),
     };
-    Json(json!({ "sessions": sessions_json, "revoke_supported": true })).into_response()
+    Json(json!({ "sessions": sessions_json, "revoke_supported": false })).into_response()
 }
 
 async fn revoke_customer_security_session(
@@ -997,10 +997,9 @@ async fn revoke_customer_security_session(
     headers: HeaderMap,
     Json(payload): Json<RevokeCustomerSecuritySessionRequest>,
 ) -> Response {
-    let ctx = match config.authenticator.authenticate(&headers).await {
-        Ok(c) => c,
-        Err(e) => return e,
-    };
+    if let Err(response) = config.authenticator.authenticate(&headers).await {
+        return response;
+    }
     let device = payload.device.trim();
     if device.is_empty() {
         return (
@@ -1010,33 +1009,12 @@ async fn revoke_customer_security_session(
             .into_response();
     }
 
-    let uid = match caller_user_id(&config, &ctx).await {
-        Ok(uid) => uid,
-        Err(response) => return response,
-    };
-    let pool = match customer_pool(&config) {
-        Ok(pool) => pool,
-        Err(response) => return response,
-    };
-    let revoked = match store::revoke_session(pool, uid, device).await {
-        Ok(found) => found,
-        Err(err) => return dependency_error("postgres", "session_revoke_failed", err),
-    };
-    if !revoked {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "session_not_found", "ok": false })),
-        )
-            .into_response();
-    }
-
     (
-        StatusCode::OK,
+        StatusCode::NOT_IMPLEMENTED,
         Json(json!({
-            "ok": true,
+            "ok": false,
+            "error": "provider_session_revocation_not_configured",
             "device": device,
-            "status": "revoked",
-            "revoked_at_ms": unix_epoch_ms(),
         })),
     )
         .into_response()
@@ -1072,7 +1050,6 @@ fn allowed_api_key_scopes() -> &'static [&'static str] {
         "cron:write",
         "rate-limit:read",
         "rate-limit:write",
-        "admin:read",
     ]
 }
 
@@ -1570,7 +1547,7 @@ fn api_key_summary_panel() -> Markup {
                     }
                     div {
                         dt { "Rotation" }
-                        dd { "dual-key overlap enabled" }
+                        dd { "rotation invalidates the previous secret immediately" }
                     }
                 }
                 a class="button-link" href="/app/api-keys" { "Manage keys" }
@@ -1584,7 +1561,7 @@ fn security_summary_panel() -> Markup {
         section class="panel" aria-labelledby="security-summary-heading" {
             div class="panel__header" {
                 h2 id="security-summary-heading" { "Security" }
-                span { "2FA ready" }
+                span { "2FA enrollment available" }
             }
             div class="panel-body stack" {
                 p class="muted" { "Require TOTP two-factor authentication for admins before production key issuance." }
@@ -1750,7 +1727,6 @@ fn api_keys_markup() -> Markup {
                         option value="cron:write" { "cron:write" }
                         option value="rate-limit:read" { "rate-limit:read" }
                         option value="rate-limit:write" { "rate-limit:write" }
-                        option value="admin:read" { "admin:read" }
                     }
                 }
                 label class="checkbox-line" {
@@ -1764,7 +1740,7 @@ fn api_keys_markup() -> Markup {
         section class="panel" aria-labelledby="api-keys-heading" {
             div class="panel__header" {
                 h2 id="api-keys-heading" { "Customer API keys" }
-                span { "rotate without downtime" }
+                span { "immediate rotation" }
             }
             div class="table-wrap" {
                 table data-api-keys-table="" {
