@@ -4,16 +4,23 @@
 // is delegated to fiducia-auth so there is exactly one credential authority.
 mod auth;
 mod entity;
+mod request_security;
 mod store;
 
-use auth::{bearer_token, Authenticator, CustomerCtx, CUSTOMER_SESSION_COOKIE};
+use auth::{
+    bearer_token, cookie_value, Authenticator, CustomerCtx, CUSTOMER_LOGIN_CSRF_COOKIE,
+    CUSTOMER_SESSION_COOKIE,
+};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::Request;
 use axum::extract::{Form, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{routing::get, Json, Router};
 use maud::{html, Markup, DOCTYPE};
+use request_security::{RequestSecurity, RequestSecurityError};
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -44,7 +51,11 @@ const HTMX_JS: &str = include_str!("../assets/htmx.min.js");
 const CUSTOMER_CSS: &str = include_str!("../assets/customer.css");
 const CUSTOMER_ORG_HEADER: &str = "x-fiducia-org-id";
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+const CUSTOMER_CSRF_HEADER: &str = "x-fiducia-csrf";
 const CORS_MAX_AGE_SECS: u64 = 10 * 60;
+const MAX_API_KEY_NAME_CHARS: usize = 100;
+const MAX_TIMEZONE_CHARS: usize = 64;
+const MAX_SESSION_DEVICE_CHARS: usize = 200;
 
 const CUSTOMER_REGIONS: &[&str] = &["auto", "iad1", "sfo1", "ams1", "fra1", "sin1", "syd1"];
 
@@ -59,7 +70,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "static".to_string())
         .into();
 
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8080);
     let customer_app_origin = customer_app_origin_from_env()?;
+    let request_security = RequestSecurity::from_env(port)?;
     // Customer state is always durable. A missing/unreachable database is a
     // deployment error, not permission to serve invented customer data.
     let pool = connect_customer_db().await?;
@@ -77,14 +93,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth_url: Some(required_env("FIDUCIA_AUTH_URL")?),
         pool: Some(pool),
         authenticator: Authenticator::from_env(),
+        request_security,
     };
 
     let app = build_router(config);
 
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8080);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
     tracing::info!(
@@ -180,6 +193,7 @@ fn customer_cors(origin: HeaderValue) -> CorsLayer {
             header::CONTENT_TYPE,
             HeaderName::from_static(CUSTOMER_ORG_HEADER),
             HeaderName::from_static(IDEMPOTENCY_KEY_HEADER),
+            HeaderName::from_static(CUSTOMER_CSRF_HEADER),
         ])
         .max_age(Duration::from_secs(CORS_MAX_AGE_SECS))
 }
@@ -194,6 +208,7 @@ fn build_router(config: AppConfig) -> Router {
         .append_index_html_on_directories(true)
         .fallback(ServeFile::new(config.static_dir.join("404.html")));
     let customer_app_origin = config.customer_app_origin.clone();
+    let request_security = config.request_security.clone();
     // Routes are declared as flat literals (not nested) so the shared API-docs
     // generator (remote/tools/generate-api-docs.mjs, which scans the router's
     // route declarations) records their true paths.
@@ -245,6 +260,14 @@ fn build_router(config: AppConfig) -> Router {
         .route(
             "/app/api-keys",
             get(customer_api_keys).post(create_customer_api_key_form),
+        )
+        .route(
+            "/app/api-keys/rotate",
+            axum::routing::post(rotate_customer_api_key_form),
+        )
+        .route(
+            "/app/api-keys/revoke",
+            axum::routing::post(revoke_customer_api_key_form),
         )
         .route("/app/security", get(customer_security))
         .route(
@@ -305,7 +328,12 @@ fn build_router(config: AppConfig) -> Router {
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::new(Duration::from_secs(REQUEST_TIMEOUT_SECS)))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
-        .layer(CatchPanicLayer::new());
+        .layer(CatchPanicLayer::new())
+        .layer(middleware::from_fn_with_state(
+            request_security,
+            request_security_gate,
+        ))
+        .layer(middleware::from_fn(security_headers));
 
     match customer_app_origin {
         Some(origin) => router.layer(customer_cors(origin)),
@@ -330,10 +358,109 @@ struct AppConfig {
     /// Verifies the customer's Supabase session for `/api/customer/*` and scopes
     /// writes to their org. Fail-closed (`Deny`) when no auth backend is set.
     authenticator: Authenticator,
+    request_security: RequestSecurity,
+}
+
+fn request_security_error(error: RequestSecurityError) -> Response {
+    tracing::warn!(reason = error.code(), "rejected untrusted customer request");
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "ok": false,
+            "error": "customer_request_rejected",
+            "reason": error.code()
+        })),
+    )
+        .into_response()
+}
+
+fn customer_csrf_token(config: &AppConfig, customer: &CustomerCtx) -> String {
+    config.request_security.csrf_token(customer.csrf_binding())
+}
+
+fn require_form_security(
+    headers: &HeaderMap,
+    config: &AppConfig,
+    customer: &CustomerCtx,
+    provided_csrf: &str,
+) -> Result<(), RequestSecurityError> {
+    config.request_security.require_same_origin(headers)?;
+    config
+        .request_security
+        .verify_csrf_token(customer.csrf_binding(), provided_csrf)
+}
+
+fn require_api_write_security(
+    headers: &HeaderMap,
+    config: &AppConfig,
+    customer: &CustomerCtx,
+) -> Result<(), RequestSecurityError> {
+    if customer.is_browser_session() {
+        config.request_security.require_same_origin(headers)?;
+        let provided = headers
+            .get(CUSTOMER_CSRF_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        config
+            .request_security
+            .verify_csrf_token(customer.csrf_binding(), provided)
+    } else {
+        config.request_security.require_api_host(headers)
+    }
+}
+
+async fn request_security_gate(
+    State(security): State<RequestSecurity>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    let method = request.method();
+    let browser_surface = path == "/login" || path == "/logout" || path.starts_with("/app");
+    let customer_api = path.starts_with("/api/customer");
+    let exact_origin_required = path == CUSTOMER_WS_PATH
+        || (browser_surface && !matches!(*method, Method::GET | Method::HEAD));
+    let result = if exact_origin_required {
+        security.require_same_origin(request.headers())
+    } else if browser_surface || customer_api {
+        security.require_api_host(request.headers())
+    } else {
+        Ok(())
+    };
+    if let Err(error) = result {
+        return request_security_error(error);
+    }
+    next.run(request).await
+}
+
+async fn security_headers(request: Request, next: Next) -> Response {
+    let path = request.uri().path();
+    let sensitive = path == "/login"
+        || path == "/logout"
+        || path.starts_with("/app")
+        || path.starts_with("/api/customer");
+    let mut response = next.run(request).await;
+    if sensitive {
+        let headers = response.headers_mut();
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(
+                "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'; connect-src 'self'; img-src 'self' data:; style-src 'self'",
+            ),
+        );
+        headers.insert(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        );
+    }
+    response
 }
 
 #[derive(Debug, Deserialize)]
 struct CustomerLoginForm {
+    csrf_token: String,
     email: String,
     password: String,
 }
@@ -360,21 +487,23 @@ async fn customer_css() -> impl IntoResponse {
     )
 }
 
-async fn customer_login() -> Markup {
-    customer_login_markup(None)
+async fn customer_login(State(config): State<AppConfig>) -> Response {
+    customer_login_page(&config, None)
 }
 
 async fn customer_login_submit(
     State(config): State<AppConfig>,
+    headers: HeaderMap,
     Form(form): Form<CustomerLoginForm>,
 ) -> Response {
+    if let Err(error) = require_login_security(&headers, &config, &form.csrf_token) {
+        return request_security_error(error);
+    }
     let email = form.email.trim();
     if email.is_empty() || form.password.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            customer_login_markup(Some("Email and password are required.")),
-        )
-            .into_response();
+        let mut response = customer_login_page(&config, Some("Email and password are required."));
+        *response.status_mut() = StatusCode::BAD_REQUEST;
+        return response;
     }
     let (Some(supabase_url), Some(publishable_key)) = (
         config.supabase_url.as_deref(),
@@ -407,11 +536,10 @@ async fn customer_login_submit(
     let response = match response {
         Ok(response) if response.status().is_success() => response,
         Ok(_) => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                customer_login_markup(Some("Supabase rejected those credentials.")),
-            )
-                .into_response()
+            let mut response =
+                customer_login_page(&config, Some("Supabase rejected those credentials."));
+            *response.status_mut() = StatusCode::UNAUTHORIZED;
+            return response;
         }
         Err(error) => return dependency_error("supabase", "supabase_login_failed", error),
     };
@@ -430,52 +558,131 @@ async fn customer_login_submit(
         return response;
     }
 
-    (
-        StatusCode::SEE_OTHER,
-        [
-            (header::LOCATION, "/app".to_string()),
-            (
-                header::SET_COOKIE,
-                make_customer_session_cookie(&session.access_token),
-            ),
-        ],
+    let mut response = (StatusCode::SEE_OTHER, [(header::LOCATION, "/app")]).into_response();
+    append_set_cookie(
+        &mut response,
+        &make_customer_session_cookie(&session.access_token),
+    );
+    append_set_cookie(&mut response, &clear_customer_login_csrf_cookie());
+    response
+}
+
+fn customer_login_page(config: &AppConfig, message: Option<&str>) -> Response {
+    let nonce = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let token = config
+        .request_security
+        .csrf_token(&format!("login\0{nonce}"));
+    let mut response = customer_login_markup(message, &token).into_response();
+    append_set_cookie(&mut response, &make_customer_login_csrf_cookie(&nonce));
+    response
+}
+
+fn require_login_security(
+    headers: &HeaderMap,
+    config: &AppConfig,
+    provided_csrf: &str,
+) -> Result<(), RequestSecurityError> {
+    config.request_security.require_same_origin(headers)?;
+    let nonce = cookie_value(headers, CUSTOMER_LOGIN_CSRF_COOKIE)
+        .ok_or(RequestSecurityError::InvalidCsrfToken)?;
+    config
+        .request_security
+        .verify_csrf_token(&format!("login\0{nonce}"), provided_csrf)
+}
+
+fn append_set_cookie(response: &mut Response, cookie: &str) {
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(cookie).expect("server-generated cookie is a valid header value"),
+    );
+}
+
+fn explicitly_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+}
+
+const fn cookie_secure_suffix_for(
+    release_hardened: bool,
+    insecure_http_explicitly_enabled: bool,
+) -> &'static str {
+    if release_hardened || !insecure_http_explicitly_enabled {
+        "; Secure"
+    } else {
+        ""
+    }
+}
+
+#[cfg(debug_assertions)]
+fn cookie_secure_suffix() -> &'static str {
+    cookie_secure_suffix_for(
+        false,
+        explicitly_enabled(std::env::var("FIDUCIA_INSECURE_COOKIES").ok().as_deref()),
     )
-        .into_response()
+}
+
+#[cfg(not(debug_assertions))]
+fn cookie_secure_suffix() -> &'static str {
+    let insecure_requested =
+        explicitly_enabled(std::env::var("FIDUCIA_INSECURE_COOKIES").ok().as_deref());
+    if insecure_requested {
+        tracing::error!(
+            "FIDUCIA_INSECURE_COOKIES is set but IGNORED: release builds always emit Secure cookies"
+        );
+    }
+    cookie_secure_suffix_for(true, insecure_requested)
+}
+
+fn make_customer_login_csrf_cookie(nonce: &str) -> String {
+    format!(
+        "{CUSTOMER_LOGIN_CSRF_COOKIE}={nonce}; Path=/; HttpOnly; SameSite=Strict; Max-Age=600{}",
+        cookie_secure_suffix()
+    )
+}
+
+fn clear_customer_login_csrf_cookie() -> String {
+    format!(
+        "{CUSTOMER_LOGIN_CSRF_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
+        cookie_secure_suffix()
+    )
 }
 
 fn make_customer_session_cookie(token: &str) -> String {
-    let secure = if std::env::var("FIDUCIA_INSECURE_COOKIES").as_deref() == Ok("1") {
-        ""
-    } else {
-        "; Secure"
-    };
     format!(
-        "{CUSTOMER_SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=3600{secure}"
+        "{CUSTOMER_SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=3600{}",
+        cookie_secure_suffix()
     )
 }
 
-async fn customer_logout() -> Response {
-    let secure = if std::env::var("FIDUCIA_INSECURE_COOKIES").as_deref() == Ok("1") {
-        ""
-    } else {
-        "; Secure"
+fn clear_customer_session_cookie() -> String {
+    format!(
+        "{CUSTOMER_SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
+        cookie_secure_suffix()
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct CustomerLogoutForm {
+    csrf_token: String,
+}
+
+async fn customer_logout(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Form(form): Form<CustomerLogoutForm>,
+) -> Response {
+    let customer = match config.authenticator.authenticate(&headers).await {
+        Ok(customer) => customer,
+        Err(response) => return response,
     };
-    (
-        StatusCode::SEE_OTHER,
-        [
-            (header::LOCATION, "/login".to_string()),
-            (
-                header::SET_COOKIE,
-                format!(
-                    "{CUSTOMER_SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}"
-                ),
-            ),
-        ],
-    )
-        .into_response()
+    if let Err(error) = require_form_security(&headers, &config, &customer, &form.csrf_token) {
+        return request_security_error(error);
+    }
+    let mut response = (StatusCode::SEE_OTHER, [(header::LOCATION, "/login")]).into_response();
+    append_set_cookie(&mut response, &clear_customer_session_cookie());
+    response
 }
 
-fn customer_login_markup(message: Option<&str>) -> Markup {
+fn customer_login_markup(message: Option<&str>, csrf_token: &str) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -496,6 +703,7 @@ fn customer_login_markup(message: Option<&str>) -> Markup {
                             p class="auth-message" role="alert" { (message) }
                         }
                         form method="post" action="/login" hx-post="/login" hx-target="body" hx-swap="outerHTML" {
+                            input type="hidden" name="csrf_token" value=(csrf_token);
                             label for="email" { "Email" }
                             input id="email" name="email" type="email" autocomplete="email" required;
                             label for="password" { "Password" }
@@ -552,9 +760,28 @@ struct CreateCustomerApiKeyRequest {
 
 #[derive(Debug, Deserialize)]
 struct CreateCustomerApiKeyForm {
+    csrf_token: String,
+    org_id: String,
+    idempotency_key: String,
     name: String,
     environment: String,
     scope: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RotateCustomerApiKeyForm {
+    csrf_token: String,
+    org_id: String,
+    idempotency_key: String,
+    prefix: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RevokeCustomerApiKeyForm {
+    csrf_token: String,
+    org_id: String,
+    idempotency_key: String,
+    prefix: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -610,17 +837,24 @@ struct RevokeCustomerSecuritySessionRequest {
 
 #[derive(Debug, Deserialize)]
 struct RevokeCustomerSessionForm {
+    csrf_token: String,
     device: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct CustomerPreferencesForm {
+    csrf_token: String,
     region: String,
     timezone: String,
     density: String,
     notify_lock_contention: Option<String>,
     notify_key_rotation: Option<String>,
     notify_mfa: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CustomerOrgSelection {
+    org_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -678,15 +912,25 @@ fn valid_org_id(value: &str) -> bool {
 }
 
 #[allow(clippy::result_large_err)]
-fn selected_customer_org(ctx: &CustomerCtx, headers: &HeaderMap) -> Result<String, Response> {
-    if let Some(requested) = headers.get(CUSTOMER_ORG_HEADER) {
-        let requested = requested.to_str().map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "ok": false, "error": "invalid_org_selection" })),
-            )
-                .into_response()
-        })?;
+fn selected_customer_org_from(
+    ctx: &CustomerCtx,
+    headers: &HeaderMap,
+    explicit: Option<&str>,
+) -> Result<String, Response> {
+    let requested = match explicit {
+        Some(requested) => Some(requested),
+        None => match headers.get(CUSTOMER_ORG_HEADER) {
+            Some(requested) => Some(requested.to_str().map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "ok": false, "error": "invalid_org_selection" })),
+                )
+                    .into_response()
+            })?),
+            None => None,
+        },
+    };
+    if let Some(requested) = requested {
         if !valid_org_id(requested) {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -716,6 +960,30 @@ fn selected_customer_org(ctx: &CustomerCtx, headers: &HeaderMap) -> Result<Strin
             Json(json!({ "ok": false, "error": "org_selection_required" })),
         )
             .into_response()),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn selected_customer_org(ctx: &CustomerCtx, headers: &HeaderMap) -> Result<String, Response> {
+    selected_customer_org_from(ctx, headers, None)
+}
+
+#[allow(clippy::result_large_err)]
+fn customer_page_org(
+    ctx: &CustomerCtx,
+    headers: &HeaderMap,
+    explicit: Option<&str>,
+) -> Result<String, Response> {
+    if explicit.is_some() || headers.contains_key(CUSTOMER_ORG_HEADER) || ctx.orgs.len() <= 1 {
+        selected_customer_org_from(ctx, headers, explicit)
+    } else {
+        ctx.orgs.first().cloned().ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "ok": false, "error": "no_org_membership" })),
+            )
+                .into_response()
+        })
     }
 }
 
@@ -911,9 +1179,13 @@ async fn customer_context_json(State(config): State<AppConfig>, headers: HeaderM
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
+    let csrf_token = ctx
+        .is_browser_session()
+        .then(|| customer_csrf_token(&config, &ctx));
     no_store_json(
         StatusCode::OK,
         json!({
+            "csrf_token": csrf_token,
             "user": {
                 "user_id": ctx.user_id,
                 "email": ctx.email,
@@ -932,6 +1204,9 @@ async fn create_customer_api_key(
         Ok(c) => c,
         Err(e) => return e,
     };
+    if let Err(error) = require_api_write_security(&headers, &config, &ctx) {
+        return request_security_error(error);
+    }
     let (display, secret) = match issue_customer_api_key(&config, &headers, &ctx, &payload).await {
         Ok(issued) => issued,
         Err(response) => return response,
@@ -1003,61 +1278,15 @@ async fn rotate_customer_api_key(
         Ok(customer) => customer,
         Err(response) => return response,
     };
-    if let Err(response) = require_idempotency_key(&headers) {
-        return response;
+    if let Err(error) = require_api_write_security(&headers, &config, &ctx) {
+        return request_security_error(error);
     }
     let prefix = payload.prefix.trim();
-    let Some(key_id) = auth_key_id_from_prefix(prefix) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "invalid_key_prefix", "ok": false })),
-        )
-            .into_response();
-    };
-
-    let org_id = match selected_customer_org(&ctx, &headers) {
-        Ok(org_id) => org_id,
-        Err(response) => return response,
-    };
-    let path = format!(
-        "/v1/keys/{}/rotate?org_id={}",
-        encode_query_value(key_id),
-        encode_query_value(&org_id)
-    );
-    let (status, body) = match auth_json(
-        &config,
-        &headers,
-        reqwest::Method::POST,
-        &path,
-        Some(json!({})),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(response) => return response,
-    };
-    if !status.is_success() {
-        return proxied_auth_error(status, body);
-    }
-    let response: AuthKeyRotateResponse = match serde_json::from_value(body) {
-        Ok(response) => response,
-        Err(error) => {
-            return dependency_error("fiducia-auth", "auth_key_rotate_bad_response", error)
-        }
-    };
-    if !raw_api_key_matches(&response.api_key, &response.key) {
-        return dependency_error(
-            "fiducia-auth",
-            "auth_key_rotate_bad_response",
-            "raw key does not match metadata",
-        );
-    }
-    let display = match auth_key_to_display(&response.key, &org_id) {
-        Ok(display) => display,
-        Err(error) => {
-            return dependency_error("fiducia-auth", "auth_key_rotate_bad_response", error)
-        }
-    };
+    let (display, replacement_secret, overlap_seconds) =
+        match rotate_customer_api_key_authority(&config, &headers, &ctx, prefix).await {
+            Ok(rotated) => rotated,
+            Err(response) => return response,
+        };
 
     no_store_json(
         StatusCode::OK,
@@ -1065,11 +1294,80 @@ async fn rotate_customer_api_key(
             "ok": true,
             "prefix": prefix,
             "rotated_at_ms": unix_epoch_ms(),
-            "replacement_secret": response.api_key,
+            "replacement_secret": replacement_secret,
             "api_key": display,
-            "overlap_seconds": response.overlap_seconds,
+            "overlap_seconds": overlap_seconds,
         }),
     )
+}
+
+async fn rotate_customer_api_key_authority(
+    config: &AppConfig,
+    headers: &HeaderMap,
+    ctx: &CustomerCtx,
+    prefix: &str,
+) -> Result<(serde_json::Value, String, u64), Response> {
+    require_idempotency_key(headers)?;
+    let Some(key_id) = auth_key_id_from_prefix(prefix) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_key_prefix", "ok": false })),
+        )
+            .into_response());
+    };
+
+    let org_id = match selected_customer_org(ctx, headers) {
+        Ok(org_id) => org_id,
+        Err(response) => return Err(response),
+    };
+    let path = format!(
+        "/v1/keys/{}/rotate?org_id={}",
+        encode_query_value(key_id),
+        encode_query_value(&org_id)
+    );
+    let (status, body) = match auth_json(
+        config,
+        headers,
+        reqwest::Method::POST,
+        &path,
+        Some(json!({})),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(response) => return Err(response),
+    };
+    if !status.is_success() {
+        return Err(proxied_auth_error(status, body));
+    }
+    let response: AuthKeyRotateResponse = match serde_json::from_value(body) {
+        Ok(response) => response,
+        Err(error) => {
+            return Err(dependency_error(
+                "fiducia-auth",
+                "auth_key_rotate_bad_response",
+                error,
+            ))
+        }
+    };
+    if !raw_api_key_matches(&response.api_key, &response.key) {
+        return Err(dependency_error(
+            "fiducia-auth",
+            "auth_key_rotate_bad_response",
+            "raw key does not match metadata",
+        ));
+    }
+    let display = match auth_key_to_display(&response.key, &org_id) {
+        Ok(display) => display,
+        Err(error) => {
+            return Err(dependency_error(
+                "fiducia-auth",
+                "auth_key_rotate_bad_response",
+                error,
+            ))
+        }
+    };
+    Ok((display, response.api_key, response.overlap_seconds))
 }
 
 async fn revoke_customer_api_key(
@@ -1081,20 +1379,37 @@ async fn revoke_customer_api_key(
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
-    if let Err(response) = require_idempotency_key(&headers) {
-        return response;
+    if let Err(error) = require_api_write_security(&headers, &config, &ctx) {
+        return request_security_error(error);
     }
     let prefix = payload.prefix.trim();
+    if let Err(response) = revoke_customer_api_key_authority(&config, &headers, &ctx, prefix).await
+    {
+        return response;
+    }
+    no_store_json(
+        StatusCode::OK,
+        json!({ "ok": true, "prefix": prefix, "status": "revoked" }),
+    )
+}
+
+async fn revoke_customer_api_key_authority(
+    config: &AppConfig,
+    headers: &HeaderMap,
+    ctx: &CustomerCtx,
+    prefix: &str,
+) -> Result<(), Response> {
+    require_idempotency_key(headers)?;
     let Some(key_id) = auth_key_id_from_prefix(prefix) else {
-        return (
+        return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "invalid_key_prefix", "ok": false })),
         )
-            .into_response();
+            .into_response());
     };
-    let org_id = match selected_customer_org(&ctx, &headers) {
+    let org_id = match selected_customer_org(ctx, headers) {
         Ok(org_id) => org_id,
-        Err(response) => return response,
+        Err(response) => return Err(response),
     };
     let path = format!(
         "/v1/keys/{}?org_id={}",
@@ -1102,30 +1417,31 @@ async fn revoke_customer_api_key(
         encode_query_value(&org_id)
     );
     let (status, body) =
-        match auth_json(&config, &headers, reqwest::Method::DELETE, &path, None).await {
+        match auth_json(config, headers, reqwest::Method::DELETE, &path, None).await {
             Ok(result) => result,
-            Err(response) => return response,
+            Err(response) => return Err(response),
         };
     if !status.is_success() {
-        return proxied_auth_error(status, body);
+        return Err(proxied_auth_error(status, body));
     }
     let response: AuthKeyRevokeResponse = match serde_json::from_value(body) {
         Ok(response) => response,
         Err(error) => {
-            return dependency_error("fiducia-auth", "auth_key_revoke_bad_response", error)
+            return Err(dependency_error(
+                "fiducia-auth",
+                "auth_key_revoke_bad_response",
+                error,
+            ))
         }
     };
     if !response.revoked {
-        return (
+        return Err((
             StatusCode::NOT_FOUND,
             Json(json!({ "ok": false, "error": "key_not_found" })),
         )
-            .into_response();
+            .into_response());
     }
-    no_store_json(
-        StatusCode::OK,
-        json!({ "ok": true, "prefix": prefix, "status": "revoked" }),
-    )
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1287,6 +1603,9 @@ async fn update_customer_preferences(
         Ok(c) => c,
         Err(e) => return e,
     };
+    if let Err(error) = require_api_write_security(&headers, &config, &ctx) {
+        return request_security_error(error);
+    }
     if !CUSTOMER_REGIONS.contains(&payload.region.as_str()) {
         return (
             StatusCode::BAD_REQUEST,
@@ -1298,6 +1617,14 @@ async fn update_customer_preferences(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "invalid_density", "ok": false })),
+        )
+            .into_response();
+    }
+    let timezone = payload.timezone.trim();
+    if timezone.is_empty() || timezone.chars().count() > MAX_TIMEZONE_CHARS {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_timezone", "ok": false })),
         )
             .into_response();
     }
@@ -1314,7 +1641,7 @@ async fn update_customer_preferences(
         pool,
         uid,
         payload.region,
-        payload.timezone,
+        timezone.to_string(),
         payload.density,
         payload.notify_key_rotation,
         payload.notify_lock_contention,
@@ -1367,11 +1694,14 @@ async fn revoke_customer_security_session(
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
+    if let Err(error) = require_api_write_security(&headers, &config, &ctx) {
+        return request_security_error(error);
+    }
     let device = payload.device.trim();
-    if device.is_empty() {
+    if device.is_empty() || device.chars().count() > MAX_SESSION_DEVICE_CHARS {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "device_required", "ok": false })),
+            Json(json!({ "error": "invalid_device", "ok": false })),
         )
             .into_response();
     }
@@ -1412,11 +1742,18 @@ async fn update_customer_preferences_form(
         Ok(customer) => customer,
         Err(response) => return response,
     };
+    if let Err(error) = require_form_security(&headers, &config, &customer, &form.csrf_token) {
+        return request_security_error(error);
+    }
     if !CUSTOMER_REGIONS.contains(&form.region.as_str()) {
         return (StatusCode::BAD_REQUEST, "invalid_region").into_response();
     }
     if !["comfortable", "compact"].contains(&form.density.as_str()) {
         return (StatusCode::BAD_REQUEST, "invalid_density").into_response();
+    }
+    let timezone = form.timezone.trim();
+    if timezone.is_empty() || timezone.chars().count() > MAX_TIMEZONE_CHARS {
+        return (StatusCode::BAD_REQUEST, "invalid_timezone").into_response();
     }
     let user_id = match caller_user_id(&config, &customer).await {
         Ok(user_id) => user_id,
@@ -1430,7 +1767,7 @@ async fn update_customer_preferences_form(
         pool,
         user_id,
         form.region,
-        form.timezone,
+        timezone.to_string(),
         form.density,
         form.notify_key_rotation.is_some(),
         form.notify_lock_contention.is_some(),
@@ -1441,7 +1778,12 @@ async fn update_customer_preferences_form(
         Ok(row) => row,
         Err(error) => return dependency_error("postgres", "preferences_write_failed", error),
     };
-    preferences_form_markup(&prefs_from_row(&row), true).into_response()
+    preferences_form_markup(
+        &prefs_from_row(&row),
+        true,
+        &customer_csrf_token(&config, &customer),
+    )
+    .into_response()
 }
 
 async fn preferences_fragment_markup(
@@ -1462,7 +1804,8 @@ async fn preferences_fragment_markup(
         Ok(None) => default_customer_preferences(),
         Err(error) => return dependency_error("postgres", "preferences_read_failed", error),
     };
-    preferences_form_markup(&preferences, saved).into_response()
+    preferences_form_markup(&preferences, saved, &customer_csrf_token(config, customer))
+        .into_response()
 }
 
 async fn customer_sessions_fragment(
@@ -1485,9 +1828,12 @@ async fn revoke_customer_session_form(
         Ok(customer) => customer,
         Err(response) => return response,
     };
+    if let Err(error) = require_form_security(&headers, &config, &customer, &form.csrf_token) {
+        return request_security_error(error);
+    }
     let device = form.device.trim();
-    if device.is_empty() {
-        return (StatusCode::BAD_REQUEST, "device_required").into_response();
+    if device.is_empty() || device.chars().count() > MAX_SESSION_DEVICE_CHARS {
+        return (StatusCode::BAD_REQUEST, "invalid_device").into_response();
     }
     let user_id = match caller_user_id(&config, &customer).await {
         Ok(user_id) => user_id,
@@ -1522,12 +1868,16 @@ async fn sessions_fragment_markup(
         Ok(sessions) => sessions,
         Err(error) => return dependency_error("postgres", "sessions_list_failed", error),
     };
-    sessions_table_markup(&sessions, message).into_response()
+    sessions_table_markup(&sessions, message, &customer_csrf_token(config, customer))
+        .into_response()
 }
 
 fn validate_api_key_request(payload: &CreateCustomerApiKeyRequest) -> Option<&'static str> {
     if payload.name.trim().is_empty() {
         return Some("name_required");
+    }
+    if payload.name.trim().chars().count() > MAX_API_KEY_NAME_CHARS {
+        return Some("name_too_long");
     }
     if !["live", "test"].contains(&payload.environment.as_str()) {
         return Some("invalid_environment");
@@ -1569,9 +1919,19 @@ fn default_customer_preferences() -> CustomerPreferences {
     }
 }
 
-async fn root(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
+async fn root(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Query(selection): Query<CustomerOrgSelection>,
+) -> Response {
     if should_serve_customer_app(&config, &headers) {
-        return customer_page_response(&config, &headers, CustomerTab::Dashboard).await;
+        return customer_page_response(
+            &config,
+            &headers,
+            CustomerTab::Dashboard,
+            selection.org_id.as_deref(),
+        )
+        .await;
     }
 
     match tokio::fs::read_to_string(config.static_dir.join("index.html")).await {
@@ -1580,46 +1940,99 @@ async fn root(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
     }
 }
 
-async fn customer_home(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
-    customer_page_response(&config, &headers, CustomerTab::Dashboard).await
+async fn customer_home(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Query(selection): Query<CustomerOrgSelection>,
+) -> Response {
+    customer_page_response(
+        &config,
+        &headers,
+        CustomerTab::Dashboard,
+        selection.org_id.as_deref(),
+    )
+    .await
 }
 
-async fn customer_auth(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
-    customer_page_response(&config, &headers, CustomerTab::Auth).await
+async fn customer_auth(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Query(selection): Query<CustomerOrgSelection>,
+) -> Response {
+    customer_page_response(
+        &config,
+        &headers,
+        CustomerTab::Auth,
+        selection.org_id.as_deref(),
+    )
+    .await
 }
 
-async fn customer_api_keys(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
-    customer_page_response(&config, &headers, CustomerTab::ApiKeys).await
+async fn customer_api_keys(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Query(selection): Query<CustomerOrgSelection>,
+) -> Response {
+    customer_page_response(
+        &config,
+        &headers,
+        CustomerTab::ApiKeys,
+        selection.org_id.as_deref(),
+    )
+    .await
 }
 
-async fn customer_security(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
-    customer_page_response(&config, &headers, CustomerTab::Security).await
+async fn customer_security(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Query(selection): Query<CustomerOrgSelection>,
+) -> Response {
+    customer_page_response(
+        &config,
+        &headers,
+        CustomerTab::Security,
+        selection.org_id.as_deref(),
+    )
+    .await
 }
 
-async fn customer_settings(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
-    customer_page_response(&config, &headers, CustomerTab::Settings).await
+async fn customer_settings(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Query(selection): Query<CustomerOrgSelection>,
+) -> Response {
+    customer_page_response(
+        &config,
+        &headers,
+        CustomerTab::Settings,
+        selection.org_id.as_deref(),
+    )
+    .await
 }
 
 async fn create_customer_api_key_form(
     State(config): State<AppConfig>,
-    mut headers: HeaderMap,
+    headers: HeaderMap,
     Form(form): Form<CreateCustomerApiKeyForm>,
 ) -> Response {
     let customer = match config.authenticator.authenticate(&headers).await {
         Ok(customer) => customer,
         Err(response) => return response,
     };
+    if let Err(error) = require_form_security(&headers, &config, &customer, &form.csrf_token) {
+        return request_security_error(error);
+    }
+    let headers =
+        match form_mutation_headers(headers, &customer, &form.org_id, &form.idempotency_key) {
+            Ok(headers) => headers,
+            Err(response) => return response,
+        };
     let payload = CreateCustomerApiKeyRequest {
         name: form.name,
         environment: form.environment,
         scope: form.scope,
         require_idempotency: Some(true),
     };
-    if !headers.contains_key(IDEMPOTENCY_KEY_HEADER) {
-        let value = HeaderValue::from_str(&Uuid::new_v4().to_string())
-            .expect("UUID idempotency key is a valid header value");
-        headers.insert(HeaderName::from_static(IDEMPOTENCY_KEY_HEADER), value);
-    }
     let (_display, secret) =
         match issue_customer_api_key(&config, &headers, &customer, &payload).await {
             Ok(issued) => issued,
@@ -1628,12 +2041,106 @@ async fn create_customer_api_key_form(
     api_keys_fragment_markup(&config, &headers, &customer, Some(&secret)).await
 }
 
-async fn api_keys_fragment(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
+#[allow(clippy::result_large_err)]
+fn form_mutation_headers(
+    mut headers: HeaderMap,
+    customer: &CustomerCtx,
+    explicit_org: &str,
+    idempotency_key: &str,
+) -> Result<HeaderMap, Response> {
+    let org_id = selected_customer_org_from(customer, &headers, Some(explicit_org))?;
+    let org_header = HeaderValue::from_str(&org_id).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "invalid_org_selection" })),
+        )
+            .into_response()
+    })?;
+    let idempotency_header = HeaderValue::from_str(idempotency_key).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "invalid_idempotency_key" })),
+        )
+            .into_response()
+    })?;
+    headers.insert(HeaderName::from_static(CUSTOMER_ORG_HEADER), org_header);
+    headers.insert(
+        HeaderName::from_static(IDEMPOTENCY_KEY_HEADER),
+        idempotency_header,
+    );
+    require_idempotency_key(&headers)?;
+    Ok(headers)
+}
+
+async fn rotate_customer_api_key_form(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Form(form): Form<RotateCustomerApiKeyForm>,
+) -> Response {
     let customer = match config.authenticator.authenticate(&headers).await {
         Ok(customer) => customer,
         Err(response) => return response,
     };
+    if let Err(error) = require_form_security(&headers, &config, &customer, &form.csrf_token) {
+        return request_security_error(error);
+    }
+    let headers =
+        match form_mutation_headers(headers, &customer, &form.org_id, &form.idempotency_key) {
+            Ok(headers) => headers,
+            Err(response) => return response,
+        };
+    let (_, replacement_secret, _) =
+        match rotate_customer_api_key_authority(&config, &headers, &customer, form.prefix.trim())
+            .await
+        {
+            Ok(rotated) => rotated,
+            Err(response) => return response,
+        };
+    api_keys_fragment_markup(&config, &headers, &customer, Some(&replacement_secret)).await
+}
+
+async fn revoke_customer_api_key_form(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Form(form): Form<RevokeCustomerApiKeyForm>,
+) -> Response {
+    let customer = match config.authenticator.authenticate(&headers).await {
+        Ok(customer) => customer,
+        Err(response) => return response,
+    };
+    if let Err(error) = require_form_security(&headers, &config, &customer, &form.csrf_token) {
+        return request_security_error(error);
+    }
+    let headers =
+        match form_mutation_headers(headers, &customer, &form.org_id, &form.idempotency_key) {
+            Ok(headers) => headers,
+            Err(response) => return response,
+        };
+    if let Err(response) =
+        revoke_customer_api_key_authority(&config, &headers, &customer, form.prefix.trim()).await
+    {
+        return response;
+    }
     api_keys_fragment_markup(&config, &headers, &customer, None).await
+}
+
+async fn api_keys_fragment(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Query(selection): Query<CustomerOrgSelection>,
+) -> Response {
+    let customer = match config.authenticator.authenticate(&headers).await {
+        Ok(customer) => customer,
+        Err(response) => return response,
+    };
+    api_keys_fragment_markup_for_org(
+        &config,
+        &headers,
+        &customer,
+        None,
+        selection.org_id.as_deref(),
+    )
+    .await
 }
 
 async fn api_keys_fragment_markup(
@@ -1642,7 +2149,17 @@ async fn api_keys_fragment_markup(
     customer: &CustomerCtx,
     secret: Option<&str>,
 ) -> Response {
-    let org_id = match selected_customer_org(customer, headers) {
+    api_keys_fragment_markup_for_org(config, headers, customer, secret, None).await
+}
+
+async fn api_keys_fragment_markup_for_org(
+    config: &AppConfig,
+    headers: &HeaderMap,
+    customer: &CustomerCtx,
+    secret: Option<&str>,
+    explicit_org: Option<&str>,
+) -> Response {
+    let org_id = match selected_customer_org_from(customer, headers, explicit_org) {
         Ok(org_id) => org_id,
         Err(response) => return response,
     };
@@ -1667,10 +2184,21 @@ async fn api_keys_fragment_markup(
         Ok(keys) => keys,
         Err(error) => return dependency_error("fiducia-auth", "auth_key_list_bad_response", error),
     };
-    api_keys_table_markup(&keys, secret).into_response()
+    api_keys_table_markup(
+        &keys,
+        secret,
+        &customer_csrf_token(config, customer),
+        &org_id,
+    )
+    .into_response()
 }
 
-fn api_keys_table_markup(keys: &[serde_json::Value], secret: Option<&str>) -> Markup {
+fn api_keys_table_markup(
+    keys: &[serde_json::Value],
+    secret: Option<&str>,
+    csrf_token: &str,
+    org_id: &str,
+) -> Markup {
     html! {
         @if let Some(secret) = secret {
             section class="panel secret-once" role="status" {
@@ -1693,19 +2221,42 @@ fn api_keys_table_markup(keys: &[serde_json::Value], secret: Option<&str>) -> Ma
                             th { "Environment" }
                             th { "Scopes" }
                             th { "State" }
+                            th { "Actions" }
                         }
                     }
                     tbody {
                         @if keys.is_empty() {
-                            tr { td colspan="5" class="muted" { "No API keys yet." } }
+                            tr { td colspan="6" class="muted" { "No API keys yet." } }
                         } @else {
                             @for key in keys {
+                                @let prefix = key.get("prefix").and_then(|value| value.as_str()).unwrap_or("");
+                                @let active = key.get("status").and_then(|value| value.as_str()) == Some("active");
                                 tr {
                                     td { (key.get("name").and_then(|value| value.as_str()).unwrap_or("")) }
                                     td { code { (key.get("prefix").and_then(|value| value.as_str()).unwrap_or("")) } }
                                     td { (key.get("environment").and_then(|value| value.as_str()).unwrap_or("")) }
                                     td { code { (key.get("scopes").and_then(|value| value.as_str()).unwrap_or("")) } }
                                     td { (key.get("status").and_then(|value| value.as_str()).unwrap_or("")) }
+                                    td {
+                                        @if active {
+                                            form method="post" action="/app/api-keys/rotate"
+                                                hx-post="/app/api-keys/rotate" hx-target="#api-key-results" hx-swap="innerHTML" {
+                                                input type="hidden" name="csrf_token" value=(csrf_token);
+                                                input type="hidden" name="org_id" value=(org_id);
+                                                input type="hidden" name="idempotency_key" value=(Uuid::new_v4().to_string());
+                                                input type="hidden" name="prefix" value=(prefix);
+                                                button type="submit" { "Rotate" }
+                                            }
+                                            form method="post" action="/app/api-keys/revoke"
+                                                hx-post="/app/api-keys/revoke" hx-target="#api-key-results" hx-swap="innerHTML" {
+                                                input type="hidden" name="csrf_token" value=(csrf_token);
+                                                input type="hidden" name="org_id" value=(org_id);
+                                                input type="hidden" name="idempotency_key" value=(Uuid::new_v4().to_string());
+                                                input type="hidden" name="prefix" value=(prefix);
+                                                button type="submit" { "Revoke" }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1720,9 +2271,26 @@ async fn customer_page_response(
     config: &AppConfig,
     headers: &HeaderMap,
     active: CustomerTab,
+    explicit_org: Option<&str>,
 ) -> Response {
     match config.authenticator.authenticate(headers).await {
-        Ok(customer) => customer_page(config, &customer, active).into_response(),
+        Ok(customer) => {
+            if let Err(error) = config.request_security.require_api_host(headers) {
+                return request_security_error(error);
+            }
+            let org_id = match customer_page_org(&customer, headers, explicit_org) {
+                Ok(org_id) => org_id,
+                Err(response) => return response,
+            };
+            customer_page(
+                config,
+                &customer,
+                active,
+                &org_id,
+                &customer_csrf_token(config, &customer),
+            )
+            .into_response()
+        }
         Err(response) if response.status() == StatusCode::UNAUTHORIZED => {
             (StatusCode::SEE_OTHER, [(header::LOCATION, "/login")]).into_response()
         }
@@ -1906,13 +2474,29 @@ impl CustomerTab {
     }
 }
 
-fn customer_page(config: &AppConfig, customer: &CustomerCtx, active: CustomerTab) -> Markup {
+fn customer_tab_href(tab: CustomerTab, org_id: &str) -> String {
+    format!("{}?org_id={}", tab.href(), encode_query_value(org_id))
+}
+
+fn customer_page(
+    config: &AppConfig,
+    customer: &CustomerCtx,
+    active: CustomerTab,
+    org_id: &str,
+    csrf_token: &str,
+) -> Markup {
+    let summary_href = format!(
+        "/app/fragments/summary?org_id={}",
+        encode_query_value(org_id)
+    );
+    let api_keys_href = customer_tab_href(CustomerTab::ApiKeys, org_id);
     html! {
         (DOCTYPE)
         html lang="en" {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
+                meta name="fiducia-customer-csrf" content=(csrf_token);
                 title { "Fiducia Customer Portal" }
                 link rel="stylesheet" href="/assets/customer.css";
                 script src="/assets/htmx.min.js" defer {}
@@ -1931,6 +2515,7 @@ fn customer_page(config: &AppConfig, customer: &CustomerCtx, active: CustomerTab
                             span class="status-pill" data-status="online" { "verified" }
                             span class="status-pill" { (customer.email.as_deref().unwrap_or(&customer.user_id)) }
                             form method="post" action="/logout" {
+                                input type="hidden" name="csrf_token" value=(csrf_token);
                                 button type="submit" { "Sign out" }
                             }
                         }
@@ -1941,12 +2526,13 @@ fn customer_page(config: &AppConfig, customer: &CustomerCtx, active: CustomerTab
                                 p class="sidebar__label" { "Workspace" }
                                 nav class="nav" aria-label="Customer portal" {
                                     @for tab in CustomerTab::all() {
+                                        @let href = customer_tab_href(tab, org_id);
                                         @if tab == active {
-                                            a href=(tab.href()) aria-current="page" {
+                                            a href=(href) aria-current="page" {
                                                 span { (tab.label()) }
                                             }
                                         } @else {
-                                            a href=(tab.href()) {
+                                            a href=(href) {
                                                 span { (tab.label()) }
                                             }
                                         }
@@ -1954,13 +2540,14 @@ fn customer_page(config: &AppConfig, customer: &CustomerCtx, active: CustomerTab
                                 }
                             }
                             section class="sidebar__section" {
-                                div class="region-select" {
-                                    label class="sidebar__label" for="region" { "Region" }
-                                    select id="region" name="region" {
-                                        @for region in CUSTOMER_REGIONS {
-                                            option value=(*region) { (*region) }
+                                form class="region-select" method="get" action=(active.href()) {
+                                    label class="sidebar__label" for="customer-org" { "Organization" }
+                                    select id="customer-org" name="org_id" {
+                                        @for available_org in &customer.orgs {
+                                            option value=(available_org) selected[available_org == org_id] { (available_org) }
                                         }
                                     }
+                                    button type="submit" { "Switch" }
                                 }
                             }
                         }
@@ -1971,12 +2558,12 @@ fn customer_page(config: &AppConfig, customer: &CustomerCtx, active: CustomerTab
                                     p { (active.description()) }
                                 }
                                 div class="toolbar" {
-                                    button type="button" hx-get="/app/fragments/summary" hx-target="#summary" hx-swap="innerHTML" { "Refresh" }
-                                    a href="/app/api-keys" { "New API key" }
+                                    button type="button" hx-get=(summary_href) hx-target="#summary" hx-swap="innerHTML" { "Refresh" }
+                                    a href=(api_keys_href) { "New API key" }
                                     a href="/api/info" { "API info" }
                                 }
                             }
-                            (customer_tab_content(config, customer, active))
+                            (customer_tab_content(config, customer, active, org_id, csrf_token))
                         }
                     }
                 }
@@ -1985,31 +2572,41 @@ fn customer_page(config: &AppConfig, customer: &CustomerCtx, active: CustomerTab
     }
 }
 
-fn customer_tab_content(config: &AppConfig, customer: &CustomerCtx, active: CustomerTab) -> Markup {
+fn customer_tab_content(
+    config: &AppConfig,
+    customer: &CustomerCtx,
+    active: CustomerTab,
+    org_id: &str,
+    csrf_token: &str,
+) -> Markup {
     match active {
-        CustomerTab::Dashboard => dashboard_markup(config, customer),
-        CustomerTab::Auth => auth_markup(customer),
-        CustomerTab::ApiKeys => api_keys_markup(),
-        CustomerTab::Security => security_markup(),
-        CustomerTab::Settings => settings_markup(),
+        CustomerTab::Dashboard => dashboard_markup(config, customer, org_id),
+        CustomerTab::Auth => auth_markup(customer, csrf_token),
+        CustomerTab::ApiKeys => api_keys_markup(org_id, csrf_token),
+        CustomerTab::Security => security_markup(org_id),
+        CustomerTab::Settings => settings_markup(org_id),
     }
 }
 
-fn dashboard_markup(config: &AppConfig, customer: &CustomerCtx) -> Markup {
+fn dashboard_markup(config: &AppConfig, customer: &CustomerCtx, org_id: &str) -> Markup {
+    let summary_href = format!(
+        "/app/fragments/summary?org_id={}",
+        encode_query_value(org_id)
+    );
     html! {
-        section id="summary" hx-get="/app/fragments/summary" hx-trigger="load, every 15s" hx-swap="innerHTML" {
+        section id="summary" hx-get=(summary_href) hx-trigger="load, every 15s" hx-swap="innerHTML" {
             (summary_markup())
         }
         div class="panel-grid panel-grid--dashboard" {
-            (auth_status_panel(config, customer))
-            (api_key_summary_panel())
-            (security_summary_panel())
-            (preferences_summary_panel())
+            (auth_status_panel(config, customer, org_id))
+            (api_key_summary_panel(org_id))
+            (security_summary_panel(org_id))
+            (preferences_summary_panel(org_id))
         }
     }
 }
 
-fn auth_status_panel(config: &AppConfig, customer: &CustomerCtx) -> Markup {
+fn auth_status_panel(config: &AppConfig, customer: &CustomerCtx, org_id: &str) -> Markup {
     let supabase_state =
         if config.supabase_url.is_some() && config.supabase_publishable_key.is_some() {
             "configured"
@@ -2034,14 +2631,14 @@ fn auth_status_panel(config: &AppConfig, customer: &CustomerCtx) -> Markup {
                 }
                 p class="muted" { "Project: " span class="mono" { (project_url) } }
                 div class="action-row" {
-                    a class="button-link" href="/app/auth" { "Account" }
+                    a class="button-link" href=(customer_tab_href(CustomerTab::Auth, org_id)) { "Account" }
                 }
             }
         }
     }
 }
 
-fn api_key_summary_panel() -> Markup {
+fn api_key_summary_panel(org_id: &str) -> Markup {
     html! {
         section class="panel" aria-labelledby="api-key-summary-heading" {
             div class="panel__header" {
@@ -2060,13 +2657,13 @@ fn api_key_summary_panel() -> Markup {
                         dd { "rotation reports the remaining edge/LB cache overlap" }
                     }
                 }
-                a class="button-link" href="/app/api-keys" { "Manage keys" }
+                a class="button-link" href=(customer_tab_href(CustomerTab::ApiKeys, org_id)) { "Manage keys" }
             }
         }
     }
 }
 
-fn security_summary_panel() -> Markup {
+fn security_summary_panel(org_id: &str) -> Markup {
     html! {
         section class="panel" aria-labelledby="security-summary-heading" {
             div class="panel__header" {
@@ -2085,13 +2682,13 @@ fn security_summary_panel() -> Markup {
                         dd { "not guessed by this service" }
                     }
                 }
-                a class="button-link" href="/app/security" { "Review security" }
+                a class="button-link" href=(customer_tab_href(CustomerTab::Security, org_id)) { "Review security" }
             }
         }
     }
 }
 
-fn preferences_summary_panel() -> Markup {
+fn preferences_summary_panel(org_id: &str) -> Markup {
     html! {
         section class="panel" aria-labelledby="preferences-summary-heading" {
             div class="panel__header" {
@@ -2101,13 +2698,13 @@ fn preferences_summary_panel() -> Markup {
             div class="panel-body stack" {
                 p class="muted" { "Set default region, alert cadence, timezone, and customer-visible notifications." }
                 p { "Values are rendered from the authenticated user's persisted row." }
-                a class="button-link" href="/app/settings" { "Open settings" }
+                a class="button-link" href=(customer_tab_href(CustomerTab::Settings, org_id)) { "Open settings" }
             }
         }
     }
 }
 
-fn auth_markup(customer: &CustomerCtx) -> Markup {
+fn auth_markup(customer: &CustomerCtx, csrf_token: &str) -> Markup {
     html! {
         section class="panel" aria-labelledby="customer-session-heading" {
             div class="panel__header" {
@@ -2128,13 +2725,18 @@ fn auth_markup(customer: &CustomerCtx) -> Markup {
                 }
             }
             form method="post" action="/logout" hx-post="/logout" {
+                input type="hidden" name="csrf_token" value=(csrf_token);
                 button type="submit" { "Sign out" }
             }
         }
     }
 }
 
-fn api_keys_markup() -> Markup {
+fn api_keys_markup(org_id: &str, csrf_token: &str) -> Markup {
+    let fragment_href = format!(
+        "/app/fragments/api-keys?org_id={}",
+        encode_query_value(org_id)
+    );
     html! {
         section class="panel" aria-labelledby="create-api-key-heading" {
             div class="panel__header" {
@@ -2143,6 +2745,9 @@ fn api_keys_markup() -> Markup {
             }
             form class="form-grid form-grid--inline" method="post" action="/app/api-keys"
                 hx-post="/app/api-keys" hx-target="#api-key-results" hx-swap="innerHTML" {
+                input type="hidden" name="csrf_token" value=(csrf_token);
+                input type="hidden" name="org_id" value=(org_id);
+                input type="hidden" name="idempotency_key" value=(Uuid::new_v4().to_string());
                 label {
                     span { "Name" }
                     input type="text" name="name" placeholder="Production checkout" required;
@@ -2176,13 +2781,17 @@ fn api_keys_markup() -> Markup {
                 button type="submit" { "Create key" }
             }
         }
-        div id="api-key-results" hx-get="/app/fragments/api-keys" hx-trigger="load" hx-swap="innerHTML" {
+        div id="api-key-results" hx-get=(fragment_href) hx-trigger="load" hx-swap="innerHTML" {
             p class="muted" { "Loading customer API keys…" }
         }
     }
 }
 
-fn security_markup() -> Markup {
+fn security_markup(org_id: &str) -> Markup {
+    let fragment_href = format!(
+        "/app/fragments/security-sessions?org_id={}",
+        encode_query_value(org_id)
+    );
     html! {
         section class="panel" aria-labelledby="auth-security-heading" {
             div class="panel__header" {
@@ -2193,7 +2802,7 @@ fn security_markup() -> Markup {
                 "MFA and passkeys are managed by Supabase Auth. This application does not display guessed enrollment state; production-key policy will only claim enforcement after fiducia-auth exposes a verified assurance level."
             }
         }
-        div id="security-sessions" hx-get="/app/fragments/security-sessions" hx-trigger="load" hx-swap="innerHTML" {
+        div id="security-sessions" hx-get=(fragment_href) hx-trigger="load" hx-swap="innerHTML" {
             p class="muted" { "Loading trusted sessions…" }
         }
     }
@@ -2202,6 +2811,7 @@ fn security_markup() -> Markup {
 fn sessions_table_markup(
     sessions: &[fiducia_interfaces_db::customer::CustomerSessionsRow],
     message: Option<&str>,
+    csrf_token: &str,
 ) -> Markup {
     html! {
         section class="panel" aria-labelledby="sessions-heading" {
@@ -2239,6 +2849,7 @@ fn sessions_table_markup(
                                                 hx-post="/app/security/sessions/revoke"
                                                 hx-target="#security-sessions"
                                                 hx-swap="innerHTML" {
+                                                input type="hidden" name="csrf_token" value=(csrf_token);
                                                 input type="hidden" name="device" value=(&session.device);
                                                 button type="submit" { "Revoke" }
                                             }
@@ -2254,15 +2865,23 @@ fn sessions_table_markup(
     }
 }
 
-fn settings_markup() -> Markup {
+fn settings_markup(org_id: &str) -> Markup {
+    let fragment_href = format!(
+        "/app/fragments/preferences?org_id={}",
+        encode_query_value(org_id)
+    );
     html! {
-        div id="customer-preferences" hx-get="/app/fragments/preferences" hx-trigger="load" hx-swap="innerHTML" {
+        div id="customer-preferences" hx-get=(fragment_href) hx-trigger="load" hx-swap="innerHTML" {
             p class="muted" { "Loading persisted preferences…" }
         }
     }
 }
 
-fn preferences_form_markup(preferences: &CustomerPreferences, saved: bool) -> Markup {
+fn preferences_form_markup(
+    preferences: &CustomerPreferences,
+    saved: bool,
+    csrf_token: &str,
+) -> Markup {
     html! {
         section class="panel" aria-labelledby="preferences-heading" {
             div class="panel__header" {
@@ -2274,6 +2893,7 @@ fn preferences_form_markup(preferences: &CustomerPreferences, saved: bool) -> Ma
             }
             form class="settings-grid" method="post" action="/app/settings"
                 hx-post="/app/settings" hx-target="#customer-preferences" hx-swap="innerHTML" {
+                input type="hidden" name="csrf_token" value=(csrf_token);
                 label class="form-field" {
                     span { "Default region" }
                     select name="region" {
@@ -2554,7 +3174,14 @@ mod tests {
                 user_id: "00000000-0000-4000-8000-000000000002".to_string(),
                 email: Some("test@fiducia.cloud".to_string()),
                 orgs: vec!["00000000-0000-0000-0000-000000000001".to_string()],
+                credential_binding: "authorization\0verified-supabase-session".to_string(),
+                cookie_authenticated: false,
             })),
+            request_security: RequestSecurity::new(
+                "https://app.fiducia.cloud",
+                b"0123456789abcdef0123456789abcdef".to_vec(),
+            )
+            .unwrap(),
         }
     }
 
@@ -2571,6 +3198,8 @@ mod tests {
             user_id: "00000000-0000-4000-8000-000000000099".to_string(),
             email: Some("multi-org@fiducia.cloud".to_string()),
             orgs: vec![ORG_A.to_string(), ORG_B.to_string()],
+            credential_binding: "authorization\0verified-supabase-session".to_string(),
+            cookie_authenticated: false,
         })))
     }
 
@@ -2585,6 +3214,7 @@ mod tests {
         let mut builder = Request::builder()
             .method(method)
             .uri(uri)
+            .header(header::HOST, "app.fiducia.cloud")
             .header(header::AUTHORIZATION, "Bearer verified-supabase-session");
         if let Some(org_id) = org_id {
             builder = builder.header(CUSTOMER_ORG_HEADER, org_id);
@@ -2626,6 +3256,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri(uri)
+                    .header(header::HOST, "app.fiducia.cloud")
                     .header("content-type", "application/json")
                     .header(IDEMPOTENCY_KEY_HEADER, "test-request-1")
                     .body(Body::from(body.to_string()))
@@ -2732,11 +3363,12 @@ mod tests {
             Request::builder()
                 .method(Method::OPTIONS)
                 .uri("/api/customer/api-keys")
+                .header(header::HOST, "app.fiducia.cloud")
                 .header(header::ORIGIN, origin)
                 .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
                 .header(
                     header::ACCESS_CONTROL_REQUEST_HEADERS,
-                    "authorization,content-type,idempotency-key,x-fiducia-org-id",
+                    "authorization,content-type,idempotency-key,x-fiducia-csrf,x-fiducia-org-id",
                 )
                 .body(Body::empty())
                 .unwrap()
@@ -2764,6 +3396,7 @@ mod tests {
             "authorization",
             "content-type",
             IDEMPOTENCY_KEY_HEADER,
+            CUSTOMER_CSRF_HEADER,
             CUSTOMER_ORG_HEADER,
         ] {
             assert!(allowed_headers.contains(required), "missing {required}");
@@ -2958,6 +3591,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/api/customer/api-keys")
+                    .header(header::HOST, "app.fiducia.cloud")
                     .header(
                         header::COOKIE,
                         format!("{CUSTOMER_SESSION_COOKIE}=cookie-supabase-session"),
@@ -3017,10 +3651,17 @@ mod tests {
 
     async fn send_with_host(uri: &str, host: Option<&str>) -> (StatusCode, String, String) {
         let app = build_router(test_config());
-        let mut builder = Request::builder().uri(uri);
-        if let Some(host) = host {
-            builder = builder.header(header::HOST, host);
-        }
+        let default_host = if uri.starts_with("/app")
+            || uri.starts_with("/login")
+            || uri.starts_with("/api/customer")
+        {
+            "app.fiducia.cloud"
+        } else {
+            "www.fiducia.cloud"
+        };
+        let builder = Request::builder()
+            .uri(uri)
+            .header(header::HOST, host.unwrap_or(default_host));
         let resp = app
             .oneshot(builder.body(Body::empty()).unwrap())
             .await
@@ -3072,32 +3713,76 @@ mod tests {
         config.supabase_url = Some(supabase_url);
         config.supabase_publishable_key = Some("public-publishable-key".to_string());
         config.authenticator = Authenticator::AuthService(auth_url);
-        let app = Router::new()
-            .route("/login", axum::routing::post(customer_login_submit))
-            .with_state(config);
+        let app = build_router(config);
+        let login_page = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/login")
+                    .header(header::HOST, "app.fiducia.cloud")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login_page.status(), StatusCode::OK);
+        let login_cookie = login_page
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .find_map(|value| {
+                let value = value.to_str().ok()?;
+                value
+                    .starts_with(&format!("{CUSTOMER_LOGIN_CSRF_COOKIE}="))
+                    .then(|| value.split(';').next().unwrap().to_string())
+            })
+            .unwrap();
+        let login_html = String::from_utf8(
+            axum::body::to_bytes(login_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let csrf_field = &login_html[login_html.find("name=\"csrf_token\"").unwrap()..];
+        let csrf_value = &csrf_field[csrf_field.find("value=\"").unwrap() + 7..];
+        let csrf_value = &csrf_value[..csrf_value.find('"').unwrap()];
 
         let response = app
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/login")
+                    .header(header::HOST, "app.fiducia.cloud")
+                    .header(header::ORIGIN, "https://app.fiducia.cloud")
+                    .header("sec-fetch-site", "same-origin")
+                    .header(header::COOKIE, login_cookie)
                     .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::from("email=customer%40example.com&password=correct"))
+                    .body(Body::from(format!(
+                        "csrf_token={csrf_value}&email=customer%40example.com&password=correct"
+                    )))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(response.headers().get("location").unwrap(), "/app");
-        let cookie = response
+        let cookies = response
             .headers()
-            .get("set-cookie")
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert!(cookie.starts_with("fiducia_customer_session=customer.jwt"));
-        assert!(cookie.contains("HttpOnly"));
-        assert!(!cookie.contains("fiducia_admin_session"));
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(cookies
+            .iter()
+            .any(|cookie| cookie.starts_with(&format!("{CUSTOMER_SESSION_COOKIE}=customer.jwt"))));
+        assert!(cookies.iter().all(|cookie| cookie.contains("HttpOnly")));
+        assert!(cookies
+            .iter()
+            .any(|cookie| cookie.starts_with(&format!("{CUSTOMER_LOGIN_CSRF_COOKIE}=;"))));
+        assert!(cookies
+            .iter()
+            .all(|cookie| !cookie.contains("fiducia_admin_session")));
         supabase_task.abort();
         auth_task.abort();
     }
@@ -3107,7 +3792,13 @@ mod tests {
         let mut config = test_config();
         config.authenticator = Authenticator::AuthService("http://127.0.0.1:1".to_string());
         let response = build_router(config)
-            .oneshot(Request::builder().uri("/app").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/app")
+                    .header(header::HOST, "app.fiducia.cloud")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
@@ -3125,6 +3816,7 @@ mod tests {
                 Request::builder()
                     .method(method)
                     .uri(uri)
+                    .header(header::HOST, "app.fiducia.cloud")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(IDEMPOTENCY_KEY_HEADER, "test-request-1")
                     .body(Body::from(payload.to_string()))
@@ -3391,6 +4083,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/app/events")
+                    .header(header::HOST, "app.fiducia.cloud")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3412,6 +4105,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/api/customer/sync/api_keys")
+                    .header(header::HOST, "app.fiducia.cloud")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from("{}"))
                     .unwrap(),
@@ -3428,6 +4122,9 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/app/ws")
+                    .header(header::HOST, "app.fiducia.cloud")
+                    .header(header::ORIGIN, "https://app.fiducia.cloud")
+                    .header("sec-fetch-site", "same-origin")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3461,6 +4158,217 @@ mod tests {
         let (status, _ct, body) = send("/does/not/exist").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("no quorum on this page"));
+    }
+
+    #[test]
+    fn release_cookie_policy_ignores_the_insecure_escape_hatch() {
+        assert_eq!(cookie_secure_suffix_for(true, true), "; Secure");
+        assert_eq!(cookie_secure_suffix_for(true, false), "; Secure");
+        assert_eq!(cookie_secure_suffix_for(false, false), "; Secure");
+        assert_eq!(cookie_secure_suffix_for(false, true), "");
+    }
+
+    #[tokio::test]
+    async fn cookie_mutations_require_exact_origin_and_bound_csrf() {
+        let customer = CustomerCtx {
+            user_id: "00000000-0000-4000-8000-000000000002".to_string(),
+            email: Some("cookie@fiducia.cloud".to_string()),
+            orgs: vec![ORG_A.to_string()],
+            credential_binding: "cookie\0customer.jwt".to_string(),
+            cookie_authenticated: true,
+        };
+        let mut config = test_config();
+        let csrf = customer_csrf_token(&config, &customer);
+        config.authenticator = Authenticator::Static(Arc::new(customer));
+        let app = build_router(config);
+        let request = |origin: &'static str, csrf: Option<&str>| {
+            let mut builder = Request::builder()
+                .method(Method::POST)
+                .uri("/api/customer/api-keys")
+                .header(header::HOST, "app.fiducia.cloud")
+                .header(header::ORIGIN, origin)
+                .header("sec-fetch-site", "same-origin")
+                .header(
+                    header::COOKIE,
+                    format!("{CUSTOMER_SESSION_COOKIE}=customer.jwt"),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(IDEMPOTENCY_KEY_HEADER, "cookie-create-1");
+            if let Some(csrf) = csrf {
+                builder = builder.header(CUSTOMER_CSRF_HEADER, csrf);
+            }
+            builder
+                .body(Body::from(
+                    json!({ "name": "", "environment": "live", "scope": "requests:write" })
+                        .to_string(),
+                ))
+                .unwrap()
+        };
+
+        let missing = app
+            .clone()
+            .oneshot(request("https://app.fiducia.cloud", None))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+
+        let sibling = app
+            .clone()
+            .oneshot(request("https://admin.fiducia.cloud", Some(&csrf)))
+            .await
+            .unwrap();
+        assert_eq!(sibling.status(), StatusCode::FORBIDDEN);
+
+        let accepted = app
+            .oneshot(request("https://app.fiducia.cloud", Some(&csrf)))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn customer_dynamic_responses_are_never_cacheable() {
+        for uri in ["/login", "/app"] {
+            let response = build_router(test_config())
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(header::HOST, "app.fiducia.cloud")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.headers().get(header::CACHE_CONTROL).unwrap(),
+                "no-store"
+            );
+            assert_eq!(response.headers().get(header::PRAGMA).unwrap(), "no-cache");
+            assert!(response
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("form-action 'self'"));
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_org_portal_propagates_only_validated_selection() {
+        let response = build_router(multi_org_config())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/app/api-keys?org_id={ORG_B}"))
+                    .header(header::HOST, "app.fiducia.cloud")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains(&format!("?org_id={ORG_B}")));
+        assert!(body.contains(&format!("name=\"org_id\" value=\"{ORG_B}\"")));
+        assert!(body.contains("name=\"csrf_token\""));
+        assert!(body.contains("name=\"idempotency_key\""));
+
+        let foreign = build_router(multi_org_config())
+            .oneshot(
+                Request::builder()
+                    .uri("/app/api-keys?org_id=00000000-0000-4000-8000-000000000003")
+                    .header(header::HOST, "app.fiducia.cloud")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn api_key_table_exposes_csrf_protected_rotation_and_revocation() {
+        let key: AuthKeyMeta = serde_json::from_value(mock_key_meta()).unwrap();
+        let display = auth_key_to_display(&key, ORG_B).unwrap();
+        let body = api_keys_table_markup(&[display], None, "csrf-test", ORG_B).into_string();
+        assert!(body.contains("/app/api-keys/rotate"));
+        assert!(body.contains("/app/api-keys/revoke"));
+        assert!(body.contains("name=\"csrf_token\" value=\"csrf-test\""));
+        assert!(body.contains("name=\"idempotency_key\""));
+        assert!(body.contains(&format!("name=\"org_id\" value=\"{ORG_B}\"")));
+    }
+
+    #[tokio::test]
+    async fn user_controlled_customer_fields_are_bounded_before_io() {
+        let (status, _, body) = send_json(
+            "POST",
+            "/api/customer/api-keys",
+            json!({
+                "name": "x".repeat(MAX_API_KEY_NAME_CHARS + 1),
+                "environment": "live",
+                "scope": "requests:write",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["error"],
+            "name_too_long"
+        );
+
+        let (status, _, body) = send_json(
+            "PUT",
+            "/api/customer/preferences",
+            json!({
+                "region": "iad1",
+                "timezone": "x".repeat(MAX_TIMEZONE_CHARS + 1),
+                "density": "compact",
+                "notify_lock_contention": false,
+                "notify_key_rotation": true,
+                "notify_mfa": true,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["error"],
+            "invalid_timezone"
+        );
+
+        let (status, _, body) = send_json(
+            "POST",
+            "/api/customer/security/sessions/revoke",
+            json!({ "device": "x".repeat(MAX_SESSION_DEVICE_CHARS + 1) }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["error"],
+            "invalid_device"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_rejects_same_site_sibling_origin() {
+        let response = build_router(test_config())
+            .oneshot(
+                Request::builder()
+                    .uri("/app/ws")
+                    .header(header::HOST, "app.fiducia.cloud")
+                    .header(header::ORIGIN, "https://admin.fiducia.cloud")
+                    .header("sec-fetch-site", "same-site")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }
 

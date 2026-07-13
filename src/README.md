@@ -18,6 +18,11 @@ The customer MASH server is a bin-only crate (no `lib.rs`).
     belong only to `fiducia-admin.rs`;
 - **`auth.rs`** — accepts the customer cookie or bearer token and delegates
   verification to `fiducia-auth`; admin cookies are deliberately ignored.
+  Credential provenance is retained, malformed explicit bearer credentials do
+  not downgrade to cookies, and duplicate canonical cookies fail closed.
+- **`request_security.rs`** — validates the exact customer Host/Origin and
+  signs credential-bound CSRF tokens used by login, HTMX forms, JSON cookie
+  writes, and the WebSocket handshake.
 - **`store.rs`** — SeaORM-owned customer profile, preference, and local-session
   CRUD over the canonical `fiducia-interfaces` schema. Credential storage is
   intentionally absent.

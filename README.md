@@ -19,7 +19,7 @@ SPA is preserved for history but is not loaded or deployed by this service.
 | Boundary | Customer | Admin |
 |---|---|---|
 | Repository | `fiducia-backend.rs` | `fiducia-admin.rs` |
-| Cookie | `fiducia_customer_session` | `fiducia_admin_session` |
+| Cookie | release `__Host-fiducia_customer_session` | release `__Host-fiducia_admin_session` |
 | Database | `fiducia-interfaces/sql/customer.sql` | `fiducia-interfaces/sql/admin.sql` |
 | Authorization | verified user plus explicit org membership | trusted operator role plus local operator registry |
 | Routes | `/app`, `/api/customer/*` | `/`, `/infra`, `/api/admin/*` |
@@ -35,10 +35,19 @@ Supabase Auth. The returned access token is verified through
 `fiducia-auth GET /v1/me`; a customer cookie is issued only for a verified user
 with trusted organization membership.
 
-The token is stored in an `HttpOnly; SameSite=Strict; Secure`
-`fiducia_customer_session` cookie. API clients may instead send the same token as
-`Authorization: Bearer ...`. Browser JavaScript never receives a service-role
-key or the application session token.
+The token is stored in an `HttpOnly; SameSite=Strict; Secure` host-only cookie.
+Release binaries use the browser-enforced `__Host-` prefix and ignore the local
+plain-HTTP escape hatch. API clients may instead send the same token as
+`Authorization: Bearer ...`; an explicit malformed or duplicate Authorization
+header never falls back to an ambient cookie, and duplicate canonical cookies
+are rejected. Browser JavaScript never receives a service-role key or the
+application session token.
+
+All dynamic customer responses are `no-store`. Browser writes require the exact
+configured Host and Origin plus a credential-bound CSRF token. Login uses a
+separate, short-lived host-only nonce cookie. WebSocket handshakes also require
+the exact Origin, preventing a same-site sibling subdomain from borrowing the
+ambient customer cookie.
 
 `fiducia-auth` is the sole API-key authority. This BFF authenticates the customer,
 requires an explicit verified organization for multi-org accounts, forwards
@@ -57,6 +66,8 @@ the auth service.
 | `GET /app/*` | authenticated Maud customer pages |
 | `GET /app/fragments/*` | authenticated HTMX fragments |
 | `POST /app/api-keys` | replay-safe HTMX API-key creation; plaintext shown once |
+| `POST /app/api-keys/rotate` | replay-safe HTMX rotation; replacement plaintext shown once |
+| `POST /app/api-keys/revoke` | replay-safe HTMX revocation |
 | `POST /app/settings` | SeaORM preference persistence |
 | `POST /app/security/sessions/revoke` | user-scoped local session audit update |
 | `GET/POST /api/customer/*` | authenticated JSON customer BFF |
@@ -91,12 +102,15 @@ DATABASE_URL=postgres://... \
 FIDUCIA_AUTH_URL=http://127.0.0.1:8097 \
 SUPABASE_URL=https://example.supabase.co \
 SUPABASE_PUBLISHABLE_KEY=public-key \
+CUSTOMER_APP_ORIGIN=http://127.0.0.1:8080 \
+FIDUCIA_CUSTOMER_CSRF_SECRET=local-only-secret-at-least-32-bytes \
 FIDUCIA_INSECURE_COOKIES=1 \
 cargo run --locked
 ```
 
-The server listens on `:8080` by default. `FIDUCIA_INSECURE_COOKIES=1` is only
-for local plain-HTTP development.
+The server listens on `:8080` by default. `FIDUCIA_INSECURE_COOKIES=1` is honored
+only by debug builds for local plain-HTTP development; release binaries always
+emit `Secure` cookies.
 
 | Variable | Meaning |
 |---|---|
@@ -106,10 +120,11 @@ for local plain-HTTP development.
 | `SUPABASE_PUBLISHABLE_KEY` | required public key for server-mediated sign-in |
 | `STATIC_DIR` | Astro marketing build; default `static` |
 | `CUSTOMER_APP_HOST` | customer host; default `app.fiducia.cloud` |
-| `CUSTOMER_APP_ORIGIN` | optional exact cross-origin browser allowlist; unset is same-origin only |
+| `CUSTOMER_APP_ORIGIN` | exact canonical customer origin and CORS allowlist; required and HTTPS in release |
+| `FIDUCIA_CUSTOMER_CSRF_SECRET` | environment-only HMAC key, at least 32 bytes; required in release |
 | `FIDUCIA_SITE_MODE=customer` | render the customer app at `/` regardless of Host |
 | `PORT` | listen port; default `8080` |
-| `FIDUCIA_INSECURE_COOKIES=1` | local-only escape hatch removing `Secure` |
+| `FIDUCIA_INSECURE_COOKIES=1` | debug-only local escape hatch; ignored by release binaries |
 | `TEST_DATABASE_URL` | opt-in real-Postgres behavior tests |
 
 `FIDUCIA_E2E_STATIC_CUSTOMER_AUTH=1` exists only in debug builds. Release
