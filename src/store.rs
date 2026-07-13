@@ -331,10 +331,7 @@ pub async fn upsert_preferences(
 }
 
 /// The user's trusted sessions, most-recently-seen first.
-pub async fn list_sessions(
-    pool: &PgPool,
-    user_id: Uuid,
-) -> Result<Vec<sess::Model>, sqlx::Error> {
+pub async fn list_sessions(pool: &PgPool, user_id: Uuid) -> Result<Vec<sess::Model>, sqlx::Error> {
     sess::Entity::find()
         .filter(sess::Column::UserId.eq(user_id))
         .order_by_desc(sess::Column::LastSeen)
@@ -649,11 +646,23 @@ mod tests {
             eprintln!("skip preferences_default_then_persist_and_bump: no TEST_DATABASE_URL");
             return;
         };
-        let uid = ensure_user(&pool, Uuid::new_v4(), "p@example.com").await.unwrap();
-        assert!(get_preferences(&pool, uid).await.unwrap().is_none(), "none until saved");
+        let uid = ensure_user(&pool, Uuid::new_v4(), "p@example.com")
+            .await
+            .unwrap();
+        assert!(
+            get_preferences(&pool, uid).await.unwrap().is_none(),
+            "none until saved"
+        );
 
         let saved = upsert_preferences(
-            &pool, uid, "iad".into(), "UTC".into(), "compact".into(), false, true, true,
+            &pool,
+            uid,
+            "iad".into(),
+            "UTC".into(),
+            "compact".into(),
+            false,
+            true,
+            true,
         )
         .await
         .unwrap();
@@ -663,13 +672,23 @@ mod tests {
 
         // Second upsert updates in place and the trigger bumps version.
         let again = upsert_preferences(
-            &pool, uid, "sfo".into(), "UTC".into(), "comfortable".into(), true, true, true,
+            &pool,
+            uid,
+            "sfo".into(),
+            "UTC".into(),
+            "comfortable".into(),
+            true,
+            true,
+            true,
         )
         .await
         .unwrap();
         assert_eq!(again.region, "sfo");
         assert_eq!(again.version, saved.version + 1);
-        assert_eq!(get_preferences(&pool, uid).await.unwrap().unwrap().region, "sfo");
+        assert_eq!(
+            get_preferences(&pool, uid).await.unwrap().unwrap().region,
+            "sfo"
+        );
     }
 
     #[tokio::test]
@@ -678,8 +697,12 @@ mod tests {
             eprintln!("skip sessions_list_and_revoke_are_user_scoped: no TEST_DATABASE_URL");
             return;
         };
-        let mine = ensure_user(&pool, Uuid::new_v4(), "me@example.com").await.unwrap();
-        let other = ensure_user(&pool, Uuid::new_v4(), "other@example.com").await.unwrap();
+        let mine = ensure_user(&pool, Uuid::new_v4(), "me@example.com")
+            .await
+            .unwrap();
+        let other = ensure_user(&pool, Uuid::new_v4(), "other@example.com")
+            .await
+            .unwrap();
         let device = uniq("MacBook");
         // Seed a session for each user (login flow creates these elsewhere).
         for uid in [mine, other] {
@@ -701,6 +724,9 @@ mod tests {
         assert_eq!(after[0].status, "revoked");
 
         // The other user's identically-named session is untouched.
-        assert_eq!(list_sessions(&pool, other).await.unwrap()[0].status, "active");
+        assert_eq!(
+            list_sessions(&pool, other).await.unwrap()[0].status,
+            "active"
+        );
     }
 }
