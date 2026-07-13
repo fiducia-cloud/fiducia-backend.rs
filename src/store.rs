@@ -234,6 +234,139 @@ pub async fn idem_record(pool: &PgPool, key: &str, version: i64) -> Result<(), s
     Ok(())
 }
 
+// ─── users / preferences / sessions (real, DB-backed customer data) ─────────
+// These back the customer Settings + Security pages. The Supabase user id (JWT
+// subject) is mirrored into a local `users` row on first access so per-user
+// preferences and trusted sessions join against a stable id.
+
+use crate::entity::{customer_preferences as prefs, customer_sessions as sess, users};
+
+/// Ensure a local `users` row exists for the authenticated Supabase user and
+/// return its id (upsert on the unique `supabase_user_id`).
+pub async fn ensure_user(
+    pool: &PgPool,
+    supabase_user_id: Uuid,
+    email: &str,
+) -> Result<Uuid, sqlx::Error> {
+    let conn = orm(pool);
+    if let Some(u) = users::Entity::find()
+        .filter(users::Column::SupabaseUserId.eq(supabase_user_id))
+        .one(&conn)
+        .await
+        .map_err(map_err)?
+    {
+        return Ok(u.id);
+    }
+    let am = users::ActiveModel {
+        supabase_user_id: Set(supabase_user_id),
+        email: Set(email.to_string()),
+        ..Default::default()
+    };
+    match am.insert(&conn).await {
+        Ok(u) => Ok(u.id),
+        // Lost a concurrent insert race → the unique index rejected us; re-read.
+        Err(_) => users::Entity::find()
+            .filter(users::Column::SupabaseUserId.eq(supabase_user_id))
+            .one(&conn)
+            .await
+            .map_err(map_err)?
+            .map(|u| u.id)
+            .ok_or(sqlx::Error::RowNotFound),
+    }
+}
+
+/// The user's stored preferences, or `None` if they've never saved any.
+pub async fn get_preferences(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Option<prefs::Model>, sqlx::Error> {
+    prefs::Entity::find_by_id(user_id)
+        .one(&orm(pool))
+        .await
+        .map_err(map_err)
+}
+
+/// Upsert the user's preferences and return the committed row (trigger bumps
+/// version/updated_at on update).
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_preferences(
+    pool: &PgPool,
+    user_id: Uuid,
+    region: String,
+    timezone: String,
+    density: String,
+    notify_key_rotation: bool,
+    notify_lock_contention: bool,
+    notify_mfa: bool,
+) -> Result<prefs::Model, sqlx::Error> {
+    let conn = orm(pool);
+    if let Some(existing) = prefs::Entity::find_by_id(user_id)
+        .one(&conn)
+        .await
+        .map_err(map_err)?
+    {
+        let mut am: prefs::ActiveModel = existing.into();
+        am.region = Set(region);
+        am.timezone = Set(timezone);
+        am.density = Set(density);
+        am.notify_key_rotation = Set(notify_key_rotation);
+        am.notify_lock_contention = Set(notify_lock_contention);
+        am.notify_mfa = Set(notify_mfa);
+        am.update(&conn).await.map_err(map_err)
+    } else {
+        prefs::ActiveModel {
+            user_id: Set(user_id),
+            region: Set(region),
+            timezone: Set(timezone),
+            density: Set(density),
+            notify_key_rotation: Set(notify_key_rotation),
+            notify_lock_contention: Set(notify_lock_contention),
+            notify_mfa: Set(notify_mfa),
+            ..Default::default()
+        }
+        .insert(&conn)
+        .await
+        .map_err(map_err)
+    }
+}
+
+/// The user's trusted sessions, most-recently-seen first.
+pub async fn list_sessions(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Vec<sess::Model>, sqlx::Error> {
+    sess::Entity::find()
+        .filter(sess::Column::UserId.eq(user_id))
+        .order_by_desc(sess::Column::LastSeen)
+        .all(&orm(pool))
+        .await
+        .map_err(map_err)
+}
+
+/// Revoke a user's session by device label (soft: `status = 'revoked'`, scoped to
+/// the caller). Returns `false` when no matching active session exists.
+pub async fn revoke_session(
+    pool: &PgPool,
+    user_id: Uuid,
+    device: &str,
+) -> Result<bool, sqlx::Error> {
+    let conn = orm(pool);
+    let existing = sess::Entity::find()
+        .filter(sess::Column::UserId.eq(user_id))
+        .filter(sess::Column::Device.eq(device))
+        .filter(sess::Column::Status.ne("revoked"))
+        .one(&conn)
+        .await
+        .map_err(map_err)?;
+    let Some(model) = existing else {
+        return Ok(false);
+    };
+    let mut am: sess::ActiveModel = model.into();
+    am.status = Set("revoked".to_string());
+    am.update(&conn).await.map_err(map_err)?;
+    Ok(true)
+}
+
 // ─── DB behavior tests ──────────────────────────────────────────────────────
 //
 // These pin the org-isolation + versioning semantics of the seam against a REAL
