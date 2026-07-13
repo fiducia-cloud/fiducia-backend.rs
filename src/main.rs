@@ -863,9 +863,10 @@ async fn update_customer_preferences(
     headers: HeaderMap,
     Json(payload): Json<CustomerPreferences>,
 ) -> Response {
-    if let Err(e) = config.authenticator.authenticate(&headers).await {
-        return e;
-    }
+    let ctx = match config.authenticator.authenticate(&headers).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
     if !CUSTOMER_REGIONS.contains(&payload.region.as_str()) {
         return (
             StatusCode::BAD_REQUEST,
@@ -881,6 +882,35 @@ async fn update_customer_preferences(
             .into_response();
     }
 
+    // Persist to the caller's row when DB-backed; echo on the no-DB dev path.
+    if let (Some(pool), Some(uid)) = (config.pool.as_ref(), caller_user_id(&config, &ctx).await) {
+        match store::upsert_preferences(
+            pool,
+            uid,
+            payload.region.clone(),
+            payload.timezone.clone(),
+            payload.density.clone(),
+            payload.notify_key_rotation,
+            payload.notify_lock_contention,
+            payload.notify_mfa,
+        )
+        .await
+        {
+            Ok(row) => {
+                return (
+                    StatusCode::OK,
+                    Json(json!({
+                        "ok": true,
+                        "preferences": prefs_from_row(&row),
+                        "saved_at_ms": unix_epoch_ms(),
+                    })),
+                )
+                    .into_response();
+            }
+            Err(err) => tracing::error!("upsert_preferences failed: {err}"),
+        }
+    }
+
     (
         StatusCode::OK,
         Json(json!({
@@ -892,11 +922,25 @@ async fn update_customer_preferences(
         .into_response()
 }
 
-async fn customer_security_sessions_json() -> Json<serde_json::Value> {
-    Json(json!({
-        "sessions": sessions().iter().map(session_json).collect::<Vec<_>>(),
-        "revoke_supported": true,
-    }))
+async fn customer_security_sessions_json(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+) -> Response {
+    let ctx = match config.authenticator.authenticate(&headers).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let sessions_json = match (config.pool.as_ref(), caller_user_id(&config, &ctx).await) {
+        (Some(pool), Some(uid)) => match store::list_sessions(pool, uid).await {
+            Ok(rows) => rows.iter().map(session_model_json).collect::<Vec<_>>(),
+            Err(err) => {
+                tracing::error!("list_sessions failed: {err}");
+                Vec::new()
+            }
+        },
+        _ => sessions().iter().map(session_json).collect::<Vec<_>>(),
+    };
+    Json(json!({ "sessions": sessions_json, "revoke_supported": true })).into_response()
 }
 
 async fn revoke_customer_security_session(
