@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Multi-stage build for fiducia-backend.
-FROM rust:1.97.0-slim-bookworm AS build
+FROM rust:1.97.0-slim-bookworm@sha256:cfbb0e0ef7a73e736386bfa346f1cb0503c6d162969dc9426fb37834f3f64c25 AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates
 WORKDIR /build
@@ -16,7 +16,7 @@ COPY . fiducia-backend.rs
 WORKDIR /build/fiducia-backend.rs
 RUN cargo build --locked --release && strip target/release/fiducia-backend
 
-FROM gcr.io/distroless/cc-debian12:nonroot
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:ce0d66bc0f64aae46e6a03add867b07f42cc7b8799c949c2e898057b7f75a151
 COPY --from=build --chown=65532:65532 /build/fiducia-backend.rs/target/release/fiducia-backend /usr/local/bin/fiducia-backend
 ENV STATIC_DIR=/app/static
 EXPOSE 8080
