@@ -4258,6 +4258,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn portal_served_at_root_on_app_host_is_hardened_like_app() {
+        // The authenticated dashboard is reachable at both `/app` and `/` (on the
+        // customer app host). It carries the user's email, org ids, and CSRF token,
+        // so the root path must be just as no-store / strict-CSP as `/app`.
+        let response = build_router(test_config())
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::HOST, "app.fiducia.cloud")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_marker = response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store",
+            "root-served portal must not be cacheable"
+        );
+        assert_eq!(response.headers().get(header::PRAGMA).unwrap(), "no-cache");
+        assert!(
+            body_marker.contains("form-action 'self'"),
+            "root-served portal must carry the strict portal CSP, got: {body_marker}"
+        );
+        assert_eq!(
+            response.headers().get(header::REFERRER_POLICY).unwrap(),
+            "no-referrer"
+        );
+    }
+
+    #[tokio::test]
     async fn customer_dynamic_responses_are_never_cacheable() {
         for uri in ["/login", "/app"] {
             let response = build_router(test_config())
