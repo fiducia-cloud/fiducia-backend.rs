@@ -20,6 +20,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: repo
+          submodules: recursive
       # The crate depends on sibling path crates under fiducia-interfaces
       # (../fiducia-interfaces/generated/rust and .../generated/rust-db), so the
       # interfaces repo must sit alongside for cargo to resolve them.
@@ -33,6 +34,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: repo
+      - name: CLI flag contract
+        working-directory: repo
+        run: |
+          make -B -C vendor/flags-2-env all
+          vendor/flags-2-env/build/flags2env audit .cli-flags.toml
       - name: fmt
         working-directory: repo
         run: cargo fmt --check

@@ -57,6 +57,15 @@ DATABASE_URL=postgres://... \
 cargo run   # listens on :8080 (override PORT)
 ```
 
+Non-secret runtime settings can also be supplied as audited flags:
+
+```bash
+make -B -C vendor/flags-2-env all
+scripts/with-flags2env.sh --port=8080 --site-mode=customer -- cargo run --locked
+```
+
+Database credentials and authentication material remain environment-only.
+
 `STATIC_DIR` defaults to `static`. Files are served from its root; the backend
 does not add a path prefix (the gateway strips `/fiducia/` before requests
 arrive — the Astro build carries the `/fiducia` base so asset URLs round-trip).
@@ -117,15 +126,19 @@ fail-closed even if the variable leaks into the environment.
 
 The pinned [`flags-2-env`](https://github.com/ORESoftware/flags-2-env) submodule
 (`vendor/flags-2-env`) maps CLI flags to the env vars above via the
-`.cli-flags.toml` schema. Build the parser once with
-`make -C vendor/flags-2-env all`, then run through `scripts/with-flags2env.sh`:
+`.cli-flags.toml` schema. Build the parser with
+`make -B -C vendor/flags-2-env all`, then run through `scripts/with-flags2env.sh`:
 
 ```bash
 scripts/with-flags2env.sh --port 8080 --static-dir ../fiducia-ui.web/dist -- cargo run
 ```
 
-`TEST_DATABASE_URL` is marked sensitive in the schema. CI audits the schema
-(`.github/workflows/cli-flags.yml`).
+`DATABASE_URL`, `TEST_DATABASE_URL`, and the debug-only static-auth switch are
+intentionally excluded from the CLI schema. Inject database credentials only
+through the environment or a secret store so they cannot leak through shell
+history or process listings. The browser-visible Supabase anonymous key is not a
+service-role secret and may be supplied as `--supabase-anon-key`. CI audits the
+schema in `.github/workflows/cli-flags.yml`.
 
 ## Deployment
 

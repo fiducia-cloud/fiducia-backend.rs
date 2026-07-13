@@ -980,7 +980,7 @@ async fn customer_security_sessions_json(
         Ok(rows) => rows.iter().map(session_model_json).collect::<Vec<_>>(),
         Err(err) => return dependency_error("postgres", "sessions_list_failed", err),
     };
-    Json(json!({ "sessions": sessions_json, "revoke_supported": false })).into_response()
+    Json(json!({ "sessions": sessions_json, "revoke_supported": true })).into_response()
 }
 
 async fn revoke_customer_security_session(
@@ -988,9 +988,10 @@ async fn revoke_customer_security_session(
     headers: HeaderMap,
     Json(payload): Json<RevokeCustomerSecuritySessionRequest>,
 ) -> Response {
-    if let Err(response) = config.authenticator.authenticate(&headers).await {
-        return response;
-    }
+    let ctx = match config.authenticator.authenticate(&headers).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
     let device = payload.device.trim();
     if device.is_empty() {
         return (
@@ -1000,15 +1001,20 @@ async fn revoke_customer_security_session(
             .into_response();
     }
 
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "ok": false,
-            "error": "provider_session_revocation_not_configured",
-            "device": device,
-        })),
-    )
-        .into_response()
+    let uid = match caller_user_id(&config, &ctx).await {
+        Ok(uid) => uid,
+        Err(response) => return response,
+    };
+    let pool = match customer_pool(&config) {
+        Ok(pool) => pool,
+        Err(response) => return response,
+    };
+    match store::revoke_session(pool, uid, device).await {
+        Ok(revoked) => {
+            Json(json!({ "ok": true, "device": device, "revoked": revoked })).into_response()
+        }
+        Err(err) => dependency_error("postgres", "session_revoke_failed", err),
+    }
 }
 
 fn validate_api_key_request(payload: &CreateCustomerApiKeyRequest) -> Option<&'static str> {
@@ -2198,7 +2204,7 @@ mod tests {
             json!({ "device": "Safari on iPhone" }),
         )
         .await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
