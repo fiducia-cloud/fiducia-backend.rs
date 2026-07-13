@@ -104,6 +104,31 @@ pub async fn list_sessions(
         .collect())
 }
 
+/// Revoke a user's locally observed session record by device label (soft:
+/// `status = 'revoked'`, scoped to the caller's user id so one user can never
+/// touch another user's rows). Returns `false` when no matching active session
+/// exists. This marks the audit record only — provider (Supabase) token
+/// revocation is a separate, not-yet-wired concern.
+pub async fn revoke_session(
+    db: &DatabaseConnection,
+    user_id: Uuid,
+    device: &str,
+) -> Result<bool, DbErr> {
+    let existing = sess::Entity::find()
+        .filter(sess::Column::UserId.eq(user_id))
+        .filter(sess::Column::Device.eq(device))
+        .filter(sess::Column::Status.ne("revoked"))
+        .one(db)
+        .await?;
+    let Some(model) = existing else {
+        return Ok(false);
+    };
+    let mut active: sess::ActiveModel = model.into();
+    active.status = Set("revoked".to_string());
+    active.update(db).await?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +239,17 @@ mod tests {
         assert_eq!(mine_rows.len(), 1);
         assert_eq!(mine_rows[0].user_id, mine);
         assert_eq!(list_sessions(&db, other).await.unwrap()[0].user_id, other);
+
+        // Revoking my session works; a repeat is a no-op (already revoked).
+        assert!(revoke_session(&db, mine, &device).await.unwrap());
+        assert!(!revoke_session(&db, mine, &device).await.unwrap());
+        assert_eq!(list_sessions(&db, mine).await.unwrap()[0].status, "revoked");
+
+        // The other user's identically-named session is untouched: the revoke
+        // is user-scoped, not device-global.
+        assert_eq!(
+            list_sessions(&db, other).await.unwrap()[0].status,
+            "active"
+        );
     }
 }
