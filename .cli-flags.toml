@@ -1,0 +1,60 @@
+# Non-secret command-line configuration for fiducia-backend. Database credentials
+# and authentication material remain environment-only.
+[help]
+url = "https://github.com/fiducia-cloud/fiducia-backend.rs"
+columns = ["options", "env", "type", "description"]
+
+[parse]
+allow_unknown = false
+
+[env]
+ignore = ["DATABASE_URL", "SUPABASE_ANON_KEY", "FIDUCIA_E2E_STATIC_CUSTOMER_AUTH"]
+
+[flags.port]
+env = "PORT"
+aliases = ["port"]
+short = "p"
+type = "integer"
+help = "HTTP listen port."
+
+[flags.static-dir]
+env = "STATIC_DIR"
+aliases = ["static-dir"]
+type = "string"
+help = "Admin UI static asset directory."
+
+[flags.customer-static-dir]
+env = "CUSTOMER_STATIC_DIR"
+aliases = ["customer-static-dir"]
+type = "string"
+help = "Customer UI static asset directory."
+
+[flags.customer-app-host]
+env = "CUSTOMER_APP_HOST"
+aliases = ["customer-app-host"]
+type = "string"
+help = "Canonical customer application host."
+
+[flags.site-mode]
+env = "FIDUCIA_SITE_MODE"
+aliases = ["site-mode"]
+type = "string"
+help = "Site rendering mode, such as customer."
+
+[flags.auth-url]
+env = "FIDUCIA_AUTH_URL"
+aliases = ["auth-url"]
+type = "string"
+help = "Authentication service base URL."
+
+[flags.supabase-url]
+env = "SUPABASE_URL"
+aliases = ["supabase-url"]
+type = "string"
+help = "Public Supabase project URL exposed to the customer UI."
+
+[flags.log]
+env = "RUST_LOG"
+aliases = ["log"]
+type = "string"
+help = "Rust tracing filter."

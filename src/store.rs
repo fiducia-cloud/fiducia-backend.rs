@@ -313,7 +313,10 @@ pub async fn upsert_preferences(
         am.notify_key_rotation = Set(notify_key_rotation);
         am.notify_lock_contention = Set(notify_lock_contention);
         am.notify_mfa = Set(notify_mfa);
-        am.update(&conn).await.map_err(map_err).map(prefs::Model::into_row)
+        am.update(&conn)
+            .await
+            .map_err(map_err)
+            .map(prefs::Model::into_row)
     } else {
         prefs::ActiveModel {
             user_id: Set(user_id),

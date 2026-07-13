@@ -57,6 +57,15 @@ DATABASE_URL=postgres://... \
 cargo run   # listens on :8080 (override PORT)
 ```
 
+Non-secret runtime settings can also be supplied as audited flags:
+
+```bash
+make -B -C vendor/flags-2-env all
+scripts/with-flags2env.sh --port=8080 --site-mode=customer -- cargo run --locked
+```
+
+Database credentials and authentication material remain environment-only.
+
 `STATIC_DIR` defaults to `static`. Files are served from its root; the backend
 does not add a path prefix (the gateway strips `/fiducia/` before requests
 arrive — the Astro build carries the `/fiducia` base so asset URLs round-trip).
