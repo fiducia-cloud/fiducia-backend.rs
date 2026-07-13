@@ -78,6 +78,44 @@ The portal does not expose `fiducia-node`'s cluster-wide observability APIs as
 customer data. Those panels explicitly remain unavailable until the node has an
 authenticated tenant-scoped read contract.
 
+## Configuration
+
+All configuration is read from the environment. Defaults are secure-by-default:
+an unset/unknown `FIDUCIA_SITE_MODE` uses host-based routing (not the permissive
+"customer" mode), and an unset `FIDUCIA_AUTH_URL` makes the customer APIs fail
+closed (`Deny`).
+
+| Var | Type | Secret? | Meaning | Default |
+|-----|------|---------|---------|---------|
+| `PORT` | integer | no | TCP port to listen on. | `8080` |
+| `STATIC_DIR` | string (dir) | no | Directory of the built Astro marketing site. | `static` |
+| `CUSTOMER_STATIC_DIR` | string (dir) | no | Directory of the built customer portal assets. | `customer-static` |
+| `CUSTOMER_APP_HOST` | string (host) | no | Host that serves the customer portal at `/`. | `app.fiducia.cloud` |
+| `FIDUCIA_SITE_MODE` | string (mode) | no | `customer` renders the portal at `/` regardless of host. Any other/unset value uses the **safe** host-based routing (portal only at `/app` or for `CUSTOMER_APP_HOST`). | unset → host-based (safe) |
+| `FIDUCIA_AUTH_URL` | string (URL) | no | Base URL of `fiducia-auth`; verifies customer Supabase sessions. **Unset → fail closed**: every `/api/customer/*` route denies. | unset → `Deny` |
+| `SUPABASE_URL` | string (URL) | no | Supabase project URL handed to the browser for realtime. | unset |
+| `SUPABASE_ANON_KEY` | string (key) | no (anon/public key) | Supabase **anon (public)** key handed to the browser for realtime. Not a service-role secret. | unset |
+| `DATABASE_URL` | string (URL) | **yes** (DB credentials) | Customer Postgres. **Required** — the service refuses to start without it. | none (required) |
+| `TEST_DATABASE_URL` | string (URL) | **yes** (DB credentials) | Postgres the test harness may create/drop freely; gates the store integration tests (unset → those tests skip). | unset |
+
+`FIDUCIA_E2E_STATIC_CUSTOMER_AUTH=1` forces a fixed test identity, but only in
+**debug** builds — it is impossible in release binaries, so production stays
+fail-closed even if the variable leaks into the environment.
+
+### CLI flags (`flags-2-env`)
+
+The pinned [`flags-2-env`](https://github.com/ORESoftware/flags-2-env) submodule
+(`vendor/flags-2-env`) maps CLI flags to the env vars above via the
+`.cli-flags.toml` schema. Build the parser once with
+`make -C vendor/flags-2-env all`, then run through `scripts/with-flags2env.sh`:
+
+```bash
+scripts/with-flags2env.sh --port 8080 --static-dir ../fiducia-ui.web/dist -- cargo run
+```
+
+`TEST_DATABASE_URL` is marked sensitive in the schema. CI audits the schema
+(`.github/workflows/cli-flags.yml`).
+
 ## Deployment
 
 Built and run in-cluster on both the AWS and Hetzner Kubernetes clusters behind
