@@ -9,13 +9,13 @@ code lives in `main.rs`.
     (`/app`, `/app/*`), plus its `/app/ws` WebSocket and `/app/events` SSE
     streams that push rendered dashboard fragments and `fiducia:sync` change
     frames;
-  - the DB-backed `api_keys` vertical and the `@fiducia/sync` write path
-    (`/api/customer/...`), served from the customer Postgres plane when
-    `DATABASE_URL` is set and degrading to in-memory mocks otherwise;
+  - PostgreSQL-backed API keys, preferences, trusted sessions, and the
+    `@fiducia/sync` write path (`/api/customer/...`). `DATABASE_URL` is required;
+    storage failures return 503 and never fabricate customer state or versions;
   - a static-file fallback that serves the built Astro site (`STATIC_DIR`).
 
-`build_router()` is intentionally split from `main()` so the unit tests (run via
-`cargo test --bins`) can exercise routes without binding a socket. The dashboard
-data (`locks()`, `requests()`, `kv_entries()`, `services()`, …) is mock/demo data
-— this tier does not implement coordination; that lives in `fiducia-node.rs` and
-`fiducia-brain.rs`.
+`build_router()` is intentionally split from `main()` so unit tests can exercise
+routes without binding a socket. Cluster-wide node observability is not exposed
+as customer data: the coordination panels state that they are unavailable until
+the node supplies an authenticated tenant-scoped read contract. This tier never
+substitutes invented lock, request, KV, or service rows.

@@ -12,7 +12,7 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{routing::get, Json, Router};
-use fiducia_interfaces_db::customer::ApiKeysRow;
+use fiducia_interfaces_db::customer::{ApiKeysRow, CustomerPreferencesRow, CustomerSessionsRow};
 use fiducia_sync_core::{ChangeEvent, ChangeOp, WriteAck};
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 use serde::{Deserialize, Serialize};
@@ -60,10 +60,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "customer-static".to_string())
         .into();
 
-    // The api_keys vertical is DB-backed when DATABASE_URL points at the customer
-    // Postgres plane. If it is unset (or the DB is unreachable) we fall back to the
-    // in-memory mock path so the portal — and the E2E suite — still boot with no DB.
-    let pool = connect_customer_db().await;
+    // Customer data is authoritative in PostgreSQL. Production must never issue
+    // credentials or acknowledge writes that were only stored in this process.
+    let pool = connect_customer_db().await?;
 
     // One process-wide broadcast channel fans server-pushed frames out to every
     // connected WS/SSE client: the existing `fiducia:refresh` fragment frames AND
@@ -82,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         supabase_anon_key: std::env::var("SUPABASE_ANON_KEY")
             .ok()
             .filter(|v| !v.is_empty()),
-        pool,
+        pool: Some(pool),
         stream_tx,
         idempotency: Arc::new(Mutex::new(HashMap::new())),
         authenticator: Authenticator::from_env(),
@@ -106,27 +105,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Open a pool to the customer Postgres plane when `DATABASE_URL` is set. Returns
-/// `None` (mock path) if the var is unset/empty, or if the connection fails — the
-/// portal must boot without a DB, so a bad/missing DB is degraded, never fatal.
-async fn connect_customer_db() -> Option<PgPool> {
+/// Open the customer PostgreSQL plane. Missing or unreachable durable storage is
+/// a startup error: serving synthetic customer state would be data loss.
+async fn connect_customer_db() -> Result<PgPool, std::io::Error> {
     let url = std::env::var("DATABASE_URL")
         .ok()
-        .filter(|v| !v.is_empty())?;
-    match sqlx::postgres::PgPoolOptions::new()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| std::io::Error::other("DATABASE_URL must be configured"))?;
+    sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
         .connect(&url)
         .await
-    {
-        Ok(pool) => {
-            tracing::info!("customer DB connected — api_keys served from Postgres");
-            Some(pool)
-        }
-        Err(err) => {
-            tracing::error!("customer DB connect failed ({err}); falling back to mock api_keys");
-            None
-        }
-    }
+        .map_err(|error| std::io::Error::other(format!("customer DB connect failed: {error}")))
+}
+
+fn storage_unavailable(detail: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "ok": false,
+            "error": "storage_unavailable",
+            "detail": detail,
+        })),
+    )
+        .into_response()
 }
 
 /// Build the application router. Separated from `main` so tests can exercise the
@@ -248,7 +250,8 @@ struct AppConfig {
     customer_site_mode: bool,
     supabase_url: Option<String>,
     supabase_anon_key: Option<String>,
-    /// Customer Postgres pool. `None` keeps the in-memory mock api_keys path.
+    /// Customer Postgres pool. `None` is reserved for isolated handler tests;
+    /// production startup always supplies a connected pool.
     pool: Option<PgPool>,
     /// Fans `fiducia:refresh` + `fiducia:sync` frames out to WS/SSE subscribers.
     stream_tx: broadcast::Sender<String>,
@@ -312,8 +315,8 @@ struct RotateCustomerApiKeyRequest {
 
 /// One queued optimistic write from the @fiducia/sync client. `table` is implied
 /// by the route (`api_keys`) but echoed by the client, so we accept it. `payload`
-/// is the row the client optimistically stored; `base_version` is the version it
-/// was edited on top of (for the ack the client reconciles against).
+/// is the row the client optimistically stored. Unknown compatibility fields such
+/// as `base_version` are ignored by Serde; committed versions always come from DB.
 #[derive(Debug, Deserialize)]
 struct SyncWriteRequest {
     id: String,
@@ -324,8 +327,6 @@ struct SyncWriteRequest {
     op: Option<String>,
     #[serde(default)]
     payload: Option<serde_json::Value>,
-    #[serde(default)]
-    base_version: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -348,18 +349,16 @@ async fn customer_api_keys_json(State(config): State<AppConfig>, headers: Header
         Ok(c) => c,
         Err(e) => return e,
     };
-    // DB-backed when a pool is present; otherwise the in-memory mock keys. A query
-    // failure degrades to the mock so a rendered table never disappears on a blip.
+    let Some(pool) = &config.pool else {
+        return storage_unavailable("customer database is not configured");
+    };
     // Scoped to the caller's org(s) — a key list must never disclose other tenants.
-    let keys = match &config.pool {
-        Some(pool) => match store::list_api_keys(pool, &ctx.org_uuids()).await {
-            Ok(rows) => rows.iter().map(api_key_row_to_display).collect::<Vec<_>>(),
-            Err(err) => {
-                tracing::error!("api_keys list query failed: {err}");
-                mock_api_keys_display()
-            }
-        },
-        None => mock_api_keys_display(),
+    let keys = match store::list_api_keys(pool, &ctx.org_uuids()).await {
+        Ok(rows) => rows.iter().map(api_key_row_to_display).collect::<Vec<_>>(),
+        Err(err) => {
+            tracing::error!("api_keys list query failed: {err}");
+            return storage_unavailable("customer database query failed");
+        }
     };
 
     Json(json!({
@@ -398,64 +397,46 @@ async fn create_customer_api_key(
     let prefix = format!("{environment_prefix}_{}", &random_token_hex(4)[..8]);
     let secret = format!("{prefix}_{}", random_token_hex(24));
 
-    // DB path: persist the key (storing only the secret hash) under the CALLER's
-    // org (never "first org"), and broadcast the new row as a fiducia:sync change.
-    if let Some(pool) = &config.pool {
-        let Some(org_id) = ctx.org_uuids().into_iter().next() else {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({ "ok": false, "error": "no_org_membership" })),
+    let Some(pool) = &config.pool else {
+        return storage_unavailable("customer database is not configured");
+    };
+    let Some(org_id) = ctx.org_uuids().into_iter().next() else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "ok": false, "error": "no_org_membership" })),
+        )
+            .into_response();
+    };
+    let new_key = store::NewApiKey {
+        key_id: &prefix,
+        org_id,
+        name: payload.name.trim(),
+        secret_hash: hash_secret(&secret),
+        scopes: json!([payload.scope]),
+        env: &payload.environment,
+    };
+    match store::insert_api_key(pool, new_key).await {
+        Ok(row) => {
+            broadcast_api_key_change(&config, &row);
+            let mut api_key = api_key_row_to_display(&row);
+            api_key["environment"] = json!(payload.environment);
+            api_key["require_idempotency"] = json!(payload.require_idempotency.unwrap_or(true));
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "ok": true,
+                    "api_key": api_key,
+                    "secret": secret,
+                    "secret_once": true,
+                })),
             )
-                .into_response();
-        };
-        let new_key = store::NewApiKey {
-            key_id: &prefix,
-            org_id,
-            name: payload.name.trim(),
-            secret_hash: hash_secret(&secret),
-            scopes: json!([payload.scope]),
-            env: &payload.environment,
-        };
-        match store::insert_api_key(pool, new_key).await {
-            Ok(row) => {
-                broadcast_api_key_change(&config, &row);
-                let mut api_key = api_key_row_to_display(&row);
-                api_key["environment"] = json!(payload.environment);
-                api_key["require_idempotency"] = json!(payload.require_idempotency.unwrap_or(true));
-                return (
-                    StatusCode::CREATED,
-                    Json(json!({
-                        "ok": true,
-                        "api_key": api_key,
-                        "secret": secret,
-                        "secret_once": true,
-                    })),
-                )
-                    .into_response();
-            }
-            Err(err) => tracing::error!("api_key insert failed: {err}"),
+                .into_response()
+        }
+        Err(err) => {
+            tracing::error!("api_key insert failed: {err}");
+            storage_unavailable("customer database write failed")
         }
     }
-
-    // Mock path (no DB, or an insert that failed): unchanged legacy response.
-    (
-        StatusCode::CREATED,
-        Json(json!({
-            "ok": true,
-            "api_key": {
-                "name": payload.name.trim(),
-                "prefix": prefix,
-                "scopes": payload.scope,
-                "last_used": "never",
-                "status": "active",
-                "environment": payload.environment,
-                "require_idempotency": payload.require_idempotency.unwrap_or(true),
-            },
-            "secret": secret,
-            "secret_once": true,
-        })),
-    )
-        .into_response()
 }
 
 async fn rotate_customer_api_key(
@@ -479,28 +460,32 @@ async fn rotate_customer_api_key(
     let issued_at_ms = unix_epoch_ms();
     let replacement_secret = format!("{prefix}_{}", random_token_hex(24));
 
-    // DB path: replace the stored secret hash, scoped to the caller's org so one
+    let Some(pool) = &config.pool else {
+        return storage_unavailable("customer database is not configured");
+    };
+    // Replace the stored secret hash, scoped to the caller's org so one
     // tenant can never rotate another tenant's key. The bump_row_version trigger
     // advances `version` + `updated_at`; broadcast the bumped row. A prefix that
     // is not the caller's org yields `Ok(None)` (no-op), reported as not-found.
-    if let Some(pool) = &config.pool {
-        match store::rotate_secret(
-            pool,
-            prefix,
-            hash_secret(&replacement_secret),
-            &ctx.org_uuids(),
-        )
-        .await
-        {
-            Ok(Some(row)) => broadcast_api_key_change(&config, &row),
-            Ok(None) => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({ "ok": false, "error": "key_not_found" })),
-                )
-                    .into_response();
-            }
-            Err(err) => tracing::error!("api_key rotate failed: {err}"),
+    match store::rotate_secret(
+        pool,
+        prefix,
+        hash_secret(&replacement_secret),
+        &ctx.org_uuids(),
+    )
+    .await
+    {
+        Ok(Some(row)) => broadcast_api_key_change(&config, &row),
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "ok": false, "error": "key_not_found" })),
+            )
+                .into_response();
+        }
+        Err(err) => {
+            tracing::error!("api_key rotate failed: {err}");
+            return storage_unavailable("customer database write failed");
         }
     }
 
@@ -533,6 +518,20 @@ async fn sync_write(
         Ok(c) => c,
         Err(e) => return e,
     };
+    if table != "api_keys" {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "ok": false,
+                "error": "unsupported_sync_table",
+                "table": table,
+            })),
+        )
+            .into_response();
+    }
+    if config.pool.is_none() {
+        return storage_unavailable("customer database is not configured");
+    }
     // Idempotency: replay the original ack for a retried key instead of re-running
     // the UPDATE (whose trigger would re-bump `version`). Matches the client's
     // stable `Idempotency-Key: table:id:op:base_version`.
@@ -543,23 +542,47 @@ async fn sync_write(
     if let Some(key) = &idem_key {
         match idempotency_begin(&config, key).await {
             Idem::Replay(v) => return ack(&req.id, v).into_response(),
-            // A concurrent identical request holds the claim; don't re-run the
-            // mutation — return the monotonic fallback so the queue still drains.
+            // A concurrent identical request holds the claim. Never fabricate a
+            // committed version; the client must retry and receive the real ack.
             Idem::InFlight => {
-                return ack(&req.id, req.base_version.unwrap_or(0) + 1).into_response()
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({ "ok": false, "error": "write_in_flight" })),
+                )
+                    .into_response()
             }
             Idem::Proceed => {}
         }
     }
 
-    let committed = match table.as_str() {
-        // Scoped to the caller's org so a client can only mutate its own rows.
-        "api_keys" => sync_write_api_keys_row(&config, &req, &ctx).await,
-        // No DB-wired write handler for this table yet — fall through to the
-        // monotonic fallback ack so the client's queue still drains.
-        _ => None,
+    let version = match sync_write_api_keys_row(&config, &req, &ctx).await {
+        Ok(Some(version)) => version,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "ok": false, "error": "api_key_not_found" })),
+            )
+                .into_response()
+        }
+        Err(SyncWriteError::InvalidId) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": "invalid_row_id" })),
+            )
+                .into_response()
+        }
+        Err(SyncWriteError::NoOrg) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "ok": false, "error": "no_org_membership" })),
+            )
+                .into_response()
+        }
+        Err(SyncWriteError::Database(error)) => {
+            tracing::error!("api_keys sync write failed: {error}");
+            return storage_unavailable("customer database write failed");
+        }
     };
-    let version = committed.unwrap_or_else(|| req.base_version.unwrap_or(0) + 1);
 
     if let Some(key) = &idem_key {
         idempotency_commit(&config, key, version).await;
@@ -578,8 +601,9 @@ enum Idem {
 }
 
 /// Begin idempotent handling of `key`. Durable (survives restarts) when a pool is
-/// present — claim-first so only the first request runs the mutation; otherwise an
-/// in-process cache (the mock/no-DB path used in tests).
+/// present — claim-first so only the first request runs the mutation. The
+/// in-process branch exists only for isolated unit construction; production
+/// startup always supplies PostgreSQL.
 async fn idempotency_begin(config: &AppConfig, key: &str) -> Idem {
     if let Some(pool) = &config.pool {
         match store::idem_claim(pool, key).await {
@@ -632,23 +656,32 @@ async fn sync_catchup(
         Ok(c) => c,
         Err(e) => return e,
     };
-    let rows: Vec<serde_json::Value> = match (table.as_str(), &config.pool) {
-        ("api_keys", Some(pool)) => {
-            let orgs = ctx.org_uuids();
-            if orgs.is_empty() {
-                vec![]
-            } else {
-                match store::catchup_api_keys(pool, &orgs, params.since, 500).await {
-                    Ok(rows) => rows.iter().map(api_key_row_to_display).collect(),
-                    Err(err) => {
-                        tracing::error!("api_keys catch-up failed: {err}");
-                        vec![]
-                    }
-                }
-            }
-        }
-        _ => vec![],
+    if table != "api_keys" {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({ "ok": false, "error": "unsupported_sync_table", "table": table })),
+        )
+            .into_response();
+    }
+    let Some(pool) = &config.pool else {
+        return storage_unavailable("customer database is not configured");
     };
+    let orgs = ctx.org_uuids();
+    if orgs.is_empty() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "ok": false, "error": "no_org_membership" })),
+        )
+            .into_response();
+    }
+    let rows: Vec<serde_json::Value> =
+        match store::catchup_api_keys(pool, &orgs, params.since, 500).await {
+            Ok(rows) => rows.iter().map(api_key_row_to_display).collect(),
+            Err(err) => {
+                tracing::error!("api_keys catch-up failed: {err}");
+                return storage_unavailable("customer database query failed");
+            }
+        };
     Json(json!({ "table": table, "since": params.since, "rows": rows })).into_response()
 }
 
@@ -663,22 +696,30 @@ fn ack(id: &str, committed_version: i64) -> (StatusCode, Json<WriteAck>) {
     )
 }
 
-/// Persist one queued optimistic write to `api_keys`, broadcasting the committed
-/// change. Returns the committed row version, or `None` when there was no pool /
-/// no matching row / a bad id (caller falls back to a monotonic ack).
+enum SyncWriteError {
+    InvalidId,
+    NoOrg,
+    Database(sqlx::Error),
+}
+
+/// Persist one queued optimistic write to `api_keys`, broadcasting only a real
+/// committed change. `None` means no org-scoped row matched.
 async fn sync_write_api_keys_row(
     config: &AppConfig,
     req: &SyncWriteRequest,
     ctx: &CustomerCtx,
-) -> Option<i64> {
-    let pool = config.pool.as_ref()?;
-    let id = Uuid::parse_str(&req.id).ok()?;
+) -> Result<Option<i64>, SyncWriteError> {
+    let pool = config
+        .pool
+        .as_ref()
+        .ok_or_else(|| SyncWriteError::Database(sqlx::Error::PoolClosed))?;
+    let id = Uuid::parse_str(&req.id).map_err(|_| SyncWriteError::InvalidId)?;
     let op = req.op.as_deref().unwrap_or("upsert");
     // Every mutation is scoped to the caller's org(s); a row in another tenant's
     // org yields no match (Option::None), so this is not a cross-tenant IDOR.
     let orgs = ctx.org_uuids();
     if orgs.is_empty() {
-        return None;
+        return Err(SyncWriteError::NoOrg);
     }
 
     let committed = if op == "delete" {
@@ -710,16 +751,12 @@ async fn sync_write_api_keys_row(
         store::upsert_fields(pool, id, &orgs, patch).await
     };
 
-    match committed {
-        Ok(Some(row)) => {
+    match committed.map_err(SyncWriteError::Database)? {
+        Some(row) => {
             broadcast_api_key_change(config, &row);
-            Some(row.version)
+            Ok(Some(row.version))
         }
-        Ok(None) => None,
-        Err(err) => {
-            tracing::error!("api_keys sync write failed: {err}");
-            None
-        }
+        None => Ok(None),
     }
 }
 
@@ -794,13 +831,35 @@ fn broadcast_api_key_change(config: &AppConfig, row: &ApiKeysRow) {
     let _ = config.stream_tx.send(frame.to_string());
 }
 
-/// The mock api_keys rendered as the same display JSON the DB path emits.
-fn mock_api_keys_display() -> Vec<serde_json::Value> {
-    api_keys().iter().map(api_key_json).collect()
-}
-
-async fn customer_preferences_json() -> Json<CustomerPreferences> {
-    Json(default_customer_preferences())
+async fn customer_preferences_json(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+) -> Response {
+    let ctx = match config.authenticator.authenticate(&headers).await {
+        Ok(ctx) => ctx,
+        Err(error) => return error,
+    };
+    let Some(pool) = &config.pool else {
+        return storage_unavailable("customer database is not configured");
+    };
+    let user_id = match customer_user_uuid(&ctx) {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
+    match sqlx::query_as::<_, CustomerPreferencesRow>(
+        "select * from customer_preferences where user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(Some(row)) => Json(preferences_from_row(&row)).into_response(),
+        Ok(None) => Json(default_customer_preferences()).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "customer preferences query failed");
+            storage_unavailable("customer database query failed")
+        }
+    }
 }
 
 async fn update_customer_preferences(
@@ -808,9 +867,10 @@ async fn update_customer_preferences(
     headers: HeaderMap,
     Json(payload): Json<CustomerPreferences>,
 ) -> Response {
-    if let Err(e) = config.authenticator.authenticate(&headers).await {
-        return e;
-    }
+    let ctx = match config.authenticator.authenticate(&headers).await {
+        Ok(ctx) => ctx,
+        Err(error) => return error,
+    };
     if !CUSTOMER_REGIONS.contains(&payload.region.as_str()) {
         return (
             StatusCode::BAD_REQUEST,
@@ -826,22 +886,77 @@ async fn update_customer_preferences(
             .into_response();
     }
 
-    (
-        StatusCode::OK,
-        Json(json!({
-            "ok": true,
-            "preferences": payload,
-            "saved_at_ms": unix_epoch_ms(),
-        })),
+    let Some(pool) = &config.pool else {
+        return storage_unavailable("customer database is not configured");
+    };
+    let user_id = match customer_user_uuid(&ctx) {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
+    match sqlx::query_as::<_, CustomerPreferencesRow>(
+        "insert into customer_preferences (user_id, density, timezone, region, notify_key_rotation, notify_lock_contention, notify_mfa) \
+         values ($1, $2, $3, $4, $5, $6, $7) \
+         on conflict (user_id) do update set density = excluded.density, timezone = excluded.timezone, \
+         region = excluded.region, notify_key_rotation = excluded.notify_key_rotation, \
+         notify_lock_contention = excluded.notify_lock_contention, notify_mfa = excluded.notify_mfa \
+         returning *",
     )
-        .into_response()
+    .bind(user_id)
+    .bind(&payload.density)
+    .bind(&payload.timezone)
+    .bind(&payload.region)
+    .bind(payload.notify_key_rotation)
+    .bind(payload.notify_lock_contention)
+    .bind(payload.notify_mfa)
+    .fetch_one(pool)
+    .await
+    {
+        Ok(row) => Json(json!({
+            "ok": true,
+            "preferences": preferences_from_row(&row),
+            "saved_at_ms": unix_epoch_ms(),
+            "version": row.version,
+        }))
+        .into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "customer preferences write failed");
+            storage_unavailable("customer database write failed")
+        }
+    }
 }
 
-async fn customer_security_sessions_json() -> Json<serde_json::Value> {
-    Json(json!({
-        "sessions": sessions().iter().map(session_json).collect::<Vec<_>>(),
-        "revoke_supported": true,
-    }))
+async fn customer_security_sessions_json(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+) -> Response {
+    let ctx = match config.authenticator.authenticate(&headers).await {
+        Ok(ctx) => ctx,
+        Err(error) => return error,
+    };
+    let Some(pool) = &config.pool else {
+        return storage_unavailable("customer database is not configured");
+    };
+    let user_id = match customer_user_uuid(&ctx) {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
+    match sqlx::query_as::<_, CustomerSessionsRow>(
+        "select * from customer_sessions where user_id = $1 and status <> 'revoked' order by last_seen desc",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => Json(json!({
+            "sessions": rows.iter().map(session_row_json).collect::<Vec<_>>(),
+            "revoke_supported": true,
+        }))
+        .into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "customer sessions query failed");
+            storage_unavailable("customer database query failed")
+        }
+    }
 }
 
 async fn revoke_customer_security_session(
@@ -849,9 +964,10 @@ async fn revoke_customer_security_session(
     headers: HeaderMap,
     Json(payload): Json<RevokeCustomerSecuritySessionRequest>,
 ) -> Response {
-    if let Err(e) = config.authenticator.authenticate(&headers).await {
-        return e;
-    }
+    let ctx = match config.authenticator.authenticate(&headers).await {
+        Ok(ctx) => ctx,
+        Err(error) => return error,
+    };
     let device = payload.device.trim();
     if device.is_empty() {
         return (
@@ -861,25 +977,69 @@ async fn revoke_customer_security_session(
             .into_response();
     }
 
-    let found = sessions().iter().any(|row| row.device == device);
-    if !found {
-        return (
+    let Some(pool) = &config.pool else {
+        return storage_unavailable("customer database is not configured");
+    };
+    let user_id = match customer_user_uuid(&ctx) {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
+    match sqlx::query_as::<_, CustomerSessionsRow>(
+        "update customer_sessions set status = 'revoked' where user_id = $1 and device = $2 and status <> 'revoked' returning *",
+    )
+    .bind(user_id)
+    .bind(device)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(Some(row)) => Json(json!({
+            "ok": true,
+            "session": session_row_json(&row),
+            "revoked_at_ms": unix_epoch_ms(),
+        }))
+        .into_response(),
+        Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "session_not_found", "ok": false })),
         )
-            .into_response();
+            .into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "customer session revoke failed");
+            storage_unavailable("customer database write failed")
+        }
     }
+}
 
-    (
-        StatusCode::OK,
-        Json(json!({
-            "ok": true,
-            "device": device,
-            "status": "revoked",
-            "revoked_at_ms": unix_epoch_ms(),
-        })),
-    )
-        .into_response()
+fn customer_user_uuid(ctx: &CustomerCtx) -> Result<Uuid, Response> {
+    Uuid::parse_str(&ctx.user_id).map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "ok": false, "error": "invalid_authenticated_user_id" })),
+        )
+            .into_response()
+    })
+}
+
+fn preferences_from_row(row: &CustomerPreferencesRow) -> CustomerPreferences {
+    CustomerPreferences {
+        region: row.region.clone(),
+        timezone: row.timezone.clone(),
+        density: row.density.clone(),
+        notify_lock_contention: row.notify_lock_contention,
+        notify_key_rotation: row.notify_key_rotation,
+        notify_mfa: row.notify_mfa,
+    }
+}
+
+fn session_row_json(row: &CustomerSessionsRow) -> serde_json::Value {
+    json!({
+        "id": row.id,
+        "device": row.device,
+        "location": row.location,
+        "last_seen": row.last_seen,
+        "status": row.status,
+        "version": row.version,
+    })
 }
 
 fn validate_api_key_request(payload: &CreateCustomerApiKeyRequest) -> Option<&'static str> {
@@ -1120,11 +1280,8 @@ fn unix_epoch_ms() -> u128 {
         .as_millis()
 }
 
-/// Hex-encoded CSPRNG token for demo secrets. The customer portal is a mock
-/// (no key is persisted), but it must still model correct behaviour: a secret
-/// is never derived from a timestamp — it comes from the OS CSPRNG, so it can't
-/// be guessed from roughly-known creation time. Mirrors fiducia-auth, which is
-/// the real issuer.
+/// Hex-encoded CSPRNG token for persisted customer credentials. A secret is
+/// never derived from a timestamp and only its SHA-256 hash reaches PostgreSQL.
 fn random_token_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     // getrandom only fails if the OS entropy source is unavailable; treat that
@@ -1205,20 +1362,6 @@ impl CustomerTab {
         }
     }
 
-    fn count(self) -> &'static str {
-        match self {
-            CustomerTab::Dashboard => "12",
-            CustomerTab::Auth => "2",
-            CustomerTab::ApiKeys => "3",
-            CustomerTab::Security => "2FA",
-            CustomerTab::Settings => "8",
-            CustomerTab::Locks => "4",
-            CustomerTab::Requests => "6",
-            CustomerTab::Kv => "3",
-            CustomerTab::Services => "5",
-        }
-    }
-
     fn description(self) -> &'static str {
         match self {
             CustomerTab::Dashboard => "Account posture, API access, realtime health, and customer operations in one workspace.",
@@ -1232,308 +1375,6 @@ impl CustomerTab {
             CustomerTab::Services => "Service discovery registrations, leader health, and instance counts.",
         }
     }
-}
-
-struct LockRow {
-    key: &'static str,
-    tenant: &'static str,
-    region: &'static str,
-    leader: &'static str,
-    holder: &'static str,
-    fencing_token: u64,
-    lease: &'static str,
-    queue: usize,
-    status: &'static str,
-}
-
-struct RequestRow {
-    method: &'static str,
-    path: &'static str,
-    tenant: &'static str,
-    region: &'static str,
-    shard: u64,
-    leader: &'static str,
-    status: &'static str,
-    latency: &'static str,
-}
-
-struct KvRow {
-    key: &'static str,
-    revision: u64,
-    region: &'static str,
-    expires: &'static str,
-    status: &'static str,
-}
-
-struct ServiceRow {
-    service: &'static str,
-    instances: usize,
-    region: &'static str,
-    leader: &'static str,
-    status: &'static str,
-}
-
-struct ApiKeyRow {
-    name: &'static str,
-    prefix: &'static str,
-    scopes: &'static str,
-    last_used: &'static str,
-    status: &'static str,
-}
-
-struct SessionRow {
-    device: &'static str,
-    location: &'static str,
-    last_seen: &'static str,
-    status: &'static str,
-}
-
-fn locks() -> [LockRow; 4] {
-    [
-        LockRow {
-            key: "checkout:tenant-42",
-            tenant: "tenant-42",
-            region: "iad1",
-            leader: "node-iad-02",
-            holder: "worker-7",
-            fencing_token: 18842,
-            lease: "11.8s",
-            queue: 2,
-            status: "held",
-        },
-        LockRow {
-            key: "invoice:tenant-17",
-            tenant: "tenant-17",
-            region: "sfo1",
-            leader: "node-sfo-01",
-            holder: "billing-3",
-            fencing_token: 9124,
-            lease: "7.1s",
-            queue: 0,
-            status: "held",
-        },
-        LockRow {
-            key: "cron:nightly-rollup",
-            tenant: "platform",
-            region: "ams1",
-            leader: "node-ams-02",
-            holder: "scheduler-1",
-            fencing_token: 5612,
-            lease: "28.4s",
-            queue: 1,
-            status: "renewing",
-        },
-        LockRow {
-            key: "deploy:tenant-88",
-            tenant: "tenant-88",
-            region: "fra1",
-            leader: "node-fra-01",
-            holder: "release-5",
-            fencing_token: 2417,
-            lease: "free",
-            queue: 0,
-            status: "available",
-        },
-    ]
-}
-
-fn requests() -> [RequestRow; 6] {
-    [
-        RequestRow {
-            method: "POST",
-            path: "/v1/locks/checkout/acquire",
-            tenant: "tenant-42",
-            region: "iad1",
-            shard: 18,
-            leader: "node-iad-02",
-            status: "committed",
-            latency: "0.74 ms",
-        },
-        RequestRow {
-            method: "PUT",
-            path: "/v1/kv/features.checkout",
-            tenant: "tenant-42",
-            region: "iad1",
-            shard: 18,
-            leader: "node-iad-02",
-            status: "committed",
-            latency: "0.81 ms",
-        },
-        RequestRow {
-            method: "POST",
-            path: "/v1/services/api/heartbeat",
-            tenant: "tenant-17",
-            region: "sfo1",
-            shard: 7,
-            leader: "node-sfo-01",
-            status: "committed",
-            latency: "0.62 ms",
-        },
-        RequestRow {
-            method: "POST",
-            path: "/v1/elections/payments/campaign",
-            tenant: "tenant-17",
-            region: "sfo1",
-            shard: 7,
-            leader: "node-sfo-01",
-            status: "redirected",
-            latency: "1.21 ms",
-        },
-        RequestRow {
-            method: "GET",
-            path: "/v1/kv/features.search",
-            tenant: "tenant-88",
-            region: "fra1",
-            shard: 29,
-            leader: "node-fra-01",
-            status: "linearized",
-            latency: "0.94 ms",
-        },
-        RequestRow {
-            method: "POST",
-            path: "/v1/rate-limit/consume",
-            tenant: "tenant-55",
-            region: "sin1",
-            shard: 33,
-            leader: "node-sin-02",
-            status: "committed",
-            latency: "0.69 ms",
-        },
-    ]
-}
-
-fn kv_entries() -> [KvRow; 3] {
-    [
-        KvRow {
-            key: "features.checkout.new_flow",
-            revision: 7734,
-            region: "iad1",
-            expires: "none",
-            status: "current",
-        },
-        KvRow {
-            key: "limits.tenant-42.write_qps",
-            revision: 7731,
-            region: "iad1",
-            expires: "none",
-            status: "current",
-        },
-        KvRow {
-            key: "maintenance.banner",
-            revision: 7718,
-            region: "ams1",
-            expires: "42m",
-            status: "ttl",
-        },
-    ]
-}
-
-fn services() -> [ServiceRow; 5] {
-    [
-        ServiceRow {
-            service: "checkout-api",
-            instances: 8,
-            region: "iad1",
-            leader: "node-iad-02",
-            status: "healthy",
-        },
-        ServiceRow {
-            service: "billing-worker",
-            instances: 5,
-            region: "sfo1",
-            leader: "node-sfo-01",
-            status: "healthy",
-        },
-        ServiceRow {
-            service: "scheduler",
-            instances: 3,
-            region: "ams1",
-            leader: "node-ams-02",
-            status: "healthy",
-        },
-        ServiceRow {
-            service: "search-indexer",
-            instances: 4,
-            region: "fra1",
-            leader: "node-fra-01",
-            status: "healthy",
-        },
-        ServiceRow {
-            service: "edge-ratelimit",
-            instances: 12,
-            region: "sin1",
-            leader: "node-sin-02",
-            status: "degraded",
-        },
-    ]
-}
-
-fn api_keys() -> [ApiKeyRow; 3] {
-    [
-        ApiKeyRow {
-            name: "Production checkout",
-            prefix: "fid_live_7Qp2",
-            scopes: "locks:write, kv:read, requests:write",
-            last_used: "38s ago",
-            status: "active",
-        },
-        ApiKeyRow {
-            name: "Billing worker",
-            prefix: "fid_live_X4a9",
-            scopes: "locks:write, services:read",
-            last_used: "7m ago",
-            status: "rotating",
-        },
-        ApiKeyRow {
-            name: "Staging replay",
-            prefix: "fid_test_H2m8",
-            scopes: "requests:write, kv:write",
-            last_used: "2h ago",
-            status: "limited",
-        },
-    ]
-}
-
-fn api_key_json(row: &ApiKeyRow) -> serde_json::Value {
-    json!({
-        "name": row.name,
-        "prefix": row.prefix,
-        "scopes": row.scopes,
-        "last_used": row.last_used,
-        "status": row.status,
-    })
-}
-
-fn sessions() -> [SessionRow; 3] {
-    [
-        SessionRow {
-            device: "Chrome on macOS",
-            location: "Lima, PE",
-            last_seen: "current",
-            status: "verified",
-        },
-        SessionRow {
-            device: "Safari on iPhone",
-            location: "San Francisco, US",
-            last_seen: "22m ago",
-            status: "active",
-        },
-        SessionRow {
-            device: "CLI token exchange",
-            location: "iad1",
-            last_seen: "1h ago",
-            status: "limited",
-        },
-    ]
-}
-
-fn session_json(row: &SessionRow) -> serde_json::Value {
-    json!({
-        "device": row.device,
-        "location": row.location,
-        "last_seen": row.last_seen,
-        "status": row.status,
-    })
 }
 
 fn customer_page(config: &AppConfig, active: CustomerTab) -> Markup {
@@ -1572,12 +1413,10 @@ fn customer_page(config: &AppConfig, active: CustomerTab) -> Markup {
                                         @if tab == active {
                                             a href=(tab.href()) aria-current="page" {
                                                 span { (tab.label()) }
-                                                span class="nav__count" { (tab.count()) }
                                             }
                                         } @else {
                                             a href=(tab.href()) {
                                                 span { (tab.label()) }
-                                                span class="nav__count" { (tab.count()) }
                                             }
                                         }
                                     }
@@ -1734,7 +1573,7 @@ fn api_key_summary_panel() -> Markup {
         section class="panel" aria-labelledby="api-key-summary-heading" {
             div class="panel__header" {
                 h2 id="api-key-summary-heading" { "API Keys" }
-                span { "3 active" }
+                span { "loaded after sign-in" }
             }
             div class="panel-body stack" {
                 p class="muted" { "Issue scoped keys for customer workloads and rotate live keys without downtime." }
@@ -1759,7 +1598,7 @@ fn security_summary_panel() -> Markup {
         section class="panel" aria-labelledby="security-summary-heading" {
             div class="panel__header" {
                 h2 id="security-summary-heading" { "Security" }
-                span { "2FA ready" }
+                span { "Supabase MFA" }
             }
             div class="panel-body stack" {
                 p class="muted" { "Require TOTP two-factor authentication for admins before production key issuance." }
@@ -1770,7 +1609,7 @@ fn security_summary_panel() -> Markup {
                     }
                     div {
                         dt { "Sessions" }
-                        dd { "3 trusted" }
+                        dd { "loaded after sign-in" }
                     }
                 }
                 a class="button-link" href="/app/security" { "Review security" }
@@ -1954,19 +1793,8 @@ fn api_keys_markup() -> Markup {
                         }
                     }
                     tbody {
-                        @for row in api_keys() {
-                            tr {
-                                td { (row.name) }
-                                td class="mono" { (row.prefix) }
-                                td class="mono" { (row.scopes) }
-                                td { (row.last_used) }
-                                td {
-                                    span class=(status_class(row.status)) data-api-key-status="" { (row.status) }
-                                }
-                                td {
-                                    button class="table-action" type="button" data-api-key-action="rotate" data-key-prefix=(row.prefix) { "Rotate" }
-                                }
-                            }
+                        tr {
+                            td colspan="6" class="muted" { "Sign in to load authoritative API keys." }
                         }
                     }
                 }
@@ -2048,22 +1876,8 @@ fn security_markup() -> Markup {
                         }
                     }
                     tbody {
-                        @for row in sessions() {
-                            tr {
-                                td { (row.device) }
-                                td { (row.location) }
-                                td { (row.last_seen) }
-                                td {
-                                    span class=(status_class(row.status)) data-session-status="" { (row.status) }
-                                }
-                                td {
-                                    @if row.status == "verified" {
-                                        span class="muted" { "Current" }
-                                    } @else {
-                                        button class="table-action" type="button" data-session-action="revoke" data-session-device=(row.device) { "Revoke" }
-                                    }
-                                }
-                            }
+                        tr {
+                            td colspan="5" class="muted" { "Sign in to load authoritative trusted sessions." }
                         }
                     }
                 }
@@ -2077,7 +1891,7 @@ fn settings_markup() -> Markup {
         section class="panel" aria-labelledby="preferences-heading" {
             div class="panel__header" {
                 h2 id="preferences-heading" { "Preferences" }
-                span { "saved per browser" }
+                span { "saved in PostgreSQL" }
             }
             form class="settings-grid" data-preference-form="" {
                 label class="form-field" {
@@ -2125,21 +1939,21 @@ fn settings_markup() -> Markup {
         section class="panel" aria-labelledby="organization-heading" {
             div class="panel__header" {
                 h2 id="organization-heading" { "Organization settings" }
-                span { "customer tenant" }
+                span { "authenticated context" }
             }
             div class="panel-body detail-grid" {
                 dl class="detail-list" {
                     div {
-                        dt { "Tenant slug" }
-                        dd class="mono" { "tenant-42" }
+                        dt { "Organization" }
+                        dd { "resolved from the authenticated session" }
                     }
                     div {
                         dt { "Plan" }
-                        dd { "Production" }
+                        dd { "resolved from the organization record" }
                     }
                     div {
                         dt { "Support route" }
-                        dd { "priority" }
+                        dd { "resolved from the organization record" }
                     }
                 }
                 dl class="detail-list" {
@@ -2179,24 +1993,24 @@ fn summary_markup() -> Markup {
     html! {
         div class="summary-grid" {
             div class="metric" {
-                p class="metric__label" { "Active Locks" }
-                p class="metric__value" { "4" }
-                p class="metric__hint" { "3 held, 1 available" }
+                p class="metric__label" { "API keys" }
+                p class="metric__value" { "live" }
+                p class="metric__hint" { "loaded from customer PostgreSQL after sign-in" }
             }
             div class="metric" {
-                p class="metric__label" { "Requests" }
-                p class="metric__value" { "6" }
-                p class="metric__hint" { "last minute sample" }
+                p class="metric__label" { "Preferences" }
+                p class="metric__value" { "live" }
+                p class="metric__hint" { "persisted per authenticated user" }
             }
             div class="metric" {
-                p class="metric__label" { "KV Revisions" }
-                p class="metric__value" { "7,734" }
-                p class="metric__hint" { "latest committed revision" }
+                p class="metric__label" { "Sessions" }
+                p class="metric__value" { "live" }
+                p class="metric__hint" { "trusted sessions from customer PostgreSQL" }
             }
             div class="metric" {
-                p class="metric__label" { "Live Instances" }
-                p class="metric__value" { "32" }
-                p class="metric__hint" { "5 service groups" }
+                p class="metric__label" { "Coordination telemetry" }
+                p class="metric__value" { "scoped" }
+                p class="metric__hint" { "hidden until node observability is tenant-aware" }
             }
         }
     }
@@ -2206,39 +2020,10 @@ fn locks_markup() -> Markup {
     html! {
         div class="panel__header" {
             h2 { "Locks" }
-            span data-freshness-clock="" { "fresh" }
+            span { "unavailable" }
         }
-        div class="table-wrap" {
-            table {
-                thead {
-                    tr {
-                        th { "Key" }
-                        th { "Tenant" }
-                        th { "Region" }
-                        th { "Leader" }
-                        th { "Holder" }
-                        th { "Fence" }
-                        th { "Lease" }
-                        th { "Queue" }
-                        th { "State" }
-                    }
-                }
-                tbody {
-                    @for row in locks() {
-                        tr {
-                            td class="mono" { (row.key) }
-                            td { (row.tenant) }
-                            td { (row.region) }
-                            td { (row.leader) }
-                            td { (row.holder) }
-                            td class="mono" { (row.fencing_token) }
-                            td { (row.lease) }
-                            td { (row.queue) }
-                            td { (status_tag(row.status)) }
-                        }
-                    }
-                }
-            }
+        div class="empty-state" {
+            "Lock inventory is not shown because the node observability API is cluster-wide, not customer-scoped."
         }
     }
 }
@@ -2247,37 +2032,10 @@ fn requests_markup() -> Markup {
     html! {
         div class="panel__header" {
             h2 { "Requests" }
-            span data-freshness-clock="" { "fresh" }
+            span { "unavailable" }
         }
-        div class="table-wrap" {
-            table {
-                thead {
-                    tr {
-                        th { "Method" }
-                        th { "Path" }
-                        th { "Tenant" }
-                        th { "Region" }
-                        th { "Shard" }
-                        th { "Leader" }
-                        th { "Status" }
-                        th { "Latency" }
-                    }
-                }
-                tbody {
-                    @for row in requests() {
-                        tr {
-                            td { (row.method) }
-                            td class="mono" { (row.path) }
-                            td { (row.tenant) }
-                            td { (row.region) }
-                            td class="mono" { (row.shard) }
-                            td { (row.leader) }
-                            td { (status_tag(row.status)) }
-                            td { (row.latency) }
-                        }
-                    }
-                }
-            }
+        div class="empty-state" {
+            "Per-request telemetry requires a customer-scoped audit source; invented request samples are never displayed."
         }
     }
 }
@@ -2286,31 +2044,10 @@ fn kv_markup() -> Markup {
     html! {
         div class="panel__header" {
             h2 { "Config KV" }
-            span data-freshness-clock="" { "fresh" }
+            span { "unavailable" }
         }
-        div class="table-wrap" {
-            table {
-                thead {
-                    tr {
-                        th { "Key" }
-                        th { "Revision" }
-                        th { "Region" }
-                        th { "TTL" }
-                        th { "State" }
-                    }
-                }
-                tbody {
-                    @for row in kv_entries() {
-                        tr {
-                            td class="mono" { (row.key) }
-                            td class="mono" { (row.revision) }
-                            td { (row.region) }
-                            td { (row.expires) }
-                            td { (status_tag(row.status)) }
-                        }
-                    }
-                }
-            }
+        div class="empty-state" {
+            "KV inventory is hidden until the node can enforce an authenticated customer namespace."
         }
     }
 }
@@ -2319,31 +2056,10 @@ fn services_markup() -> Markup {
     html! {
         div class="panel__header" {
             h2 { "Service Discovery" }
-            span data-freshness-clock="" { "fresh" }
+            span { "unavailable" }
         }
-        div class="table-wrap" {
-            table {
-                thead {
-                    tr {
-                        th { "Service" }
-                        th { "Instances" }
-                        th { "Region" }
-                        th { "Leader" }
-                        th { "State" }
-                    }
-                }
-                tbody {
-                    @for row in services() {
-                        tr {
-                            td class="mono" { (row.service) }
-                            td { (row.instances) }
-                            td { (row.region) }
-                            td { (row.leader) }
-                            td { (status_tag(row.status)) }
-                        }
-                    }
-                }
-            }
+        div class="empty-state" {
+            "Service discovery is cluster-wide today and is not exposed as customer-owned data."
         }
     }
 }
@@ -2430,8 +2146,8 @@ mod tests {
     }
 
     fn test_config() -> AppConfig {
-        // No pool → the mock api_keys path (mirrors the E2E harness, which boots
-        // the backend without DATABASE_URL).
+        // No pool: handlers must prove they fail closed instead of fabricating
+        // customer state.
         AppConfig {
             static_dir: temp_static_dir(),
             customer_static_dir: temp_customer_static_dir(),
@@ -2508,11 +2224,10 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_customer_can_create_a_key() {
-        // A verified session (Static ctx) reaches the handler; no DB → mock path 201.
-        // (Org membership is required on the DB insert path — covered by the
-        // store-seam org-scoping tests.)
+        // A verified session reaches the handler, but credentials must never be
+        // fabricated when durable storage is unavailable.
         let status = post_json(test_config(), "/api/customer/api-keys", CREATE_KEY_BODY).await;
-        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     /// Send a GET through the router and return (status, content-type, body).
@@ -2605,13 +2320,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn customer_api_keys_can_be_listed_created_and_rotated() {
+    async fn customer_api_key_routes_fail_closed_without_storage() {
         let (status, ct, body) = send("/api/customer/api-keys").await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(ct.contains("application/json"), "ct={ct}");
         let listed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(listed["api_keys"].as_array().unwrap().len(), 3);
-        assert_eq!(listed["default_require_idempotency"], true);
+        assert_eq!(listed["error"], "storage_unavailable");
 
         let (status, ct, body) = send_json(
             "POST",
@@ -2624,27 +2338,20 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(ct.contains("application/json"), "ct={ct}");
         let created: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(created["ok"], true);
-        assert_eq!(created["api_key"]["require_idempotency"], true);
-        assert!(created["api_key"]["prefix"]
-            .as_str()
-            .unwrap()
-            .starts_with("fid_live_"));
-        assert_eq!(created["secret_once"], true);
+        assert_eq!(created["error"], "storage_unavailable");
 
         let (status, _ct, body) = send_json(
             "POST",
             "/api/customer/api-keys/rotate",
-            json!({ "prefix": created["api_key"]["prefix"] }),
+            json!({ "prefix": "fid_live_unpersisted" }),
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         let rotated: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(rotated["ok"], true);
-        assert_eq!(rotated["overlap_seconds"], 900);
+        assert_eq!(rotated["error"], "storage_unavailable");
     }
 
     #[tokio::test]
@@ -2679,13 +2386,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn customer_preferences_round_trip_json() {
+    async fn customer_preferences_fail_closed_without_storage() {
         let (status, ct, body) = send("/api/customer/preferences").await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(ct.contains("application/json"), "ct={ct}");
-        let defaults: CustomerPreferences = serde_json::from_str(&body).unwrap();
-        assert_eq!(defaults.region, "auto");
-        assert!(defaults.notify_key_rotation);
+        let unavailable: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(unavailable["error"], "storage_unavailable");
 
         let (status, _ct, body) = send_json(
             "PUT",
@@ -2700,10 +2406,9 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         let saved: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(saved["ok"], true);
-        assert_eq!(saved["preferences"]["region"], "iad1");
+        assert_eq!(saved["error"], "storage_unavailable");
 
         let (status, _ct, body) = send_json(
             "PUT",
@@ -2724,13 +2429,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn customer_security_sessions_can_be_listed_and_revoked() {
+    async fn customer_security_sessions_fail_closed_without_storage() {
         let (status, ct, body) = send("/api/customer/security/sessions").await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(ct.contains("application/json"), "ct={ct}");
         let listed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(listed["sessions"].as_array().unwrap().len(), 3);
-        assert_eq!(listed["revoke_supported"], true);
+        assert_eq!(listed["error"], "storage_unavailable");
 
         let (status, _ct, body) = send_json(
             "POST",
@@ -2738,11 +2442,9 @@ mod tests {
             json!({ "device": "Safari on iPhone" }),
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         let revoked: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(revoked["ok"], true);
-        assert_eq!(revoked["device"], "Safari on iPhone");
-        assert_eq!(revoked["status"], "revoked");
+        assert_eq!(revoked["error"], "storage_unavailable");
 
         let (status, _ct, body) = send_json(
             "POST",
@@ -2750,9 +2452,9 @@ mod tests {
             json!({ "device": "Unknown browser" }),
         )
         .await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         let rejected: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(rejected["error"], "session_not_found");
+        assert_eq!(rejected["error"], "storage_unavailable");
     }
 
     #[tokio::test]
@@ -2819,9 +2521,10 @@ mod tests {
         assert!(body.contains("Login"));
         assert!(body.contains("Sign up"));
         assert!(body.contains("API Keys"));
-        assert!(body.contains("2FA ready"));
+        assert!(body.contains("Supabase MFA"));
         assert!(body.contains("Preferences"));
-        assert!(body.contains("checkout:tenant-42"));
+        assert!(body.contains("node observability API is cluster-wide"));
+        assert!(!body.contains("checkout:tenant-42"));
     }
 
     #[tokio::test]
@@ -2849,8 +2552,8 @@ mod tests {
         let (status, ct, body) = send("/app/fragments/locks").await;
         assert_eq!(status, StatusCode::OK);
         assert!(ct.contains("text/html"), "ct={ct}");
-        assert!(body.contains("Fence"));
-        assert!(body.contains("checkout:tenant-42"));
+        assert!(body.contains("node observability API is cluster-wide"));
+        assert!(!body.contains("checkout:tenant-42"));
     }
 
     #[tokio::test]
@@ -2874,7 +2577,7 @@ mod tests {
         assert!(ct.contains("text/event-stream"), "ct={ct}");
     }
 
-    async fn post_sync(config: AppConfig, key: Option<&str>, base: i64) -> serde_json::Value {
+    async fn post_sync(config: AppConfig, key: Option<&str>, base: i64) -> StatusCode {
         let app = build_router(config);
         let mut builder = Request::builder()
             .method("POST")
@@ -2888,22 +2591,17 @@ mod tests {
             .oneshot(builder.body(Body::from(body)).unwrap())
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        serde_json::from_slice(&bytes).unwrap()
+        resp.status()
     }
 
     #[tokio::test]
-    async fn sync_write_is_generic_in_table_and_acks_a_monotonic_version() {
-        // No pool in tests -> the fallback ack (base_version + 1) for ANY table, so
-        // the client's write-queue always drains.
-        let acked = post_sync(test_config(), None, 4).await;
-        assert_eq!(acked["id"], "k1");
-        assert_eq!(acked["committed_version"], 5);
+    async fn sync_write_requires_storage_and_a_supported_table() {
+        assert_eq!(
+            post_sync(test_config(), None, 4).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
 
-        // A table with no DB-wired handler still returns a valid ack (generic route).
+        // Unsupported tables are rejected rather than acknowledged without a write.
         let app = build_router(test_config());
         let resp = app
             .oneshot(
@@ -2918,24 +2616,17 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]
-    async fn sync_write_idempotency_key_replays_the_same_ack() {
-        // The Arc<Mutex> idempotency cache is shared across clones of the config.
+    async fn sync_write_never_caches_a_success_when_storage_is_unavailable() {
         let config = test_config();
         let first = post_sync(config.clone(), Some("api_keys:k1:upsert:7"), 7).await;
-        assert_eq!(first["committed_version"], 8);
+        assert_eq!(first, StatusCode::SERVICE_UNAVAILABLE);
 
-        // Same key, different base -> the ORIGINAL ack is replayed (not 1000), so a
-        // retried POST never re-runs the UPDATE / re-bumps version.
         let retry = post_sync(config.clone(), Some("api_keys:k1:upsert:7"), 999).await;
-        assert_eq!(retry["committed_version"], 8);
-
-        // A different key is computed fresh.
-        let other = post_sync(config.clone(), Some("api_keys:k2:upsert:2"), 2).await;
-        assert_eq!(other["committed_version"], 3);
+        assert_eq!(retry, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
