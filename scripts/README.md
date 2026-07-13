@@ -4,8 +4,8 @@ The customer BFF does not seed or migrate API-key rows: `fiducia-auth` owns the
 entire credential lifecycle and durable key policy.
 
 - **`with-flags2env.sh`** — bridges CLI flags to the environment variables this
-    backend reads (`PORT`, `STATIC_DIR`, `CUSTOMER_STATIC_DIR`, `FIDUCIA_*`,
-    and public `SUPABASE_*` settings). Database credentials and debug auth remain
+    backend reads (`PORT`, marketing `STATIC_DIR`, `FIDUCIA_*`, and public
+    `SUPABASE_*` settings). Database credentials and debug auth remain
     environment-only. It runs the pinned `flags2env` parser
   (`vendor/flags-2-env`) against the `.cli-flags.toml` schema, exports the
   resulting env map, then execs the given command

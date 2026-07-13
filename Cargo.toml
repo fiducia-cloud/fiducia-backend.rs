@@ -32,8 +32,18 @@ fiducia-interfaces = { path = "../fiducia-interfaces/generated/rust" }
 
 # Generated customer-plane contract row types returned by the SeaORM store.
 fiducia-interfaces-db = { path = "../fiducia-interfaces/generated/rust-db" }
+
 uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
 # `ServiceExt::oneshot` drives the router in tests without binding a socket.
 tower = { version = "0.5", features = ["util"] }
+# Test-only schema setup and seed helpers. Production database access goes
+# exclusively through SeaORM's `DatabaseConnection`.
+sqlx = { version = "0.8", features = [
+    "postgres",
+    "runtime-tokio-rustls",
+    "uuid",
+    "chrono",
+    "json",
+] }

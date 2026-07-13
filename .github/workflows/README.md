@@ -2,9 +2,9 @@
 
 GitHub Actions pipelines for this service.
 
-- **`ci.yml`** — on push/PR to `main`: `cargo fmt --check`, locked Clippy,
-  `cargo test --locked --bins` (the gating step — bin-only crate), and
-  `cargo audit`. It checks out the sibling
+- **`ci.yml`** — on push/PR to `main`: mandatory full-workspace formatting,
+  locked all-target/all-feature Clippy and tests, and a pinned `cargo-audit`.
+  It checks out the sibling
   `fiducia-cloud/fiducia-interfaces` repo at the exact commit also pinned by the
   Dockerfile so the path-dependency crates
   (`../fiducia-interfaces/generated/...`) resolve reproducibly.
