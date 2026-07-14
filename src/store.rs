@@ -194,9 +194,7 @@ pub async fn mark_notification_read(
         return Ok(false);
     };
     let mut active: notif::ActiveModel = model.into();
-    active.read_at = Set(Some(sea_orm::prelude::DateTimeWithTimeZone::from(
-        chrono_now(),
-    )));
+    active.read_at = Set(Some(chrono::Utc::now().into()));
     active.update(db).await?;
     Ok(true)
 }
