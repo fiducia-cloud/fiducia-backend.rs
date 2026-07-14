@@ -2163,6 +2163,20 @@ async fn customer_activity(
     .await
 }
 
+async fn customer_notifications(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Query(selection): Query<CustomerOrgSelection>,
+) -> Response {
+    customer_page_response(
+        &config,
+        &headers,
+        CustomerTab::Notifications,
+        selection.org_id.as_deref(),
+    )
+    .await
+}
+
 async fn customer_settings(
     State(config): State<AppConfig>,
     headers: HeaderMap,
@@ -2175,6 +2189,82 @@ async fn customer_settings(
         selection.org_id.as_deref(),
     )
     .await
+}
+
+/// Fragment: the signed-in user's notification feed. Reads are scoped to the
+/// verified caller's `user_id` at the database, so a forged `org_id` can never
+/// surface another user's notifications.
+async fn customer_notifications_fragment(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+) -> Response {
+    let customer = match config.authenticator.authenticate(&headers).await {
+        Ok(customer) => customer,
+        Err(response) => return response,
+    };
+    notifications_fragment_markup(&config, &customer, None).await
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadNotificationForm {
+    csrf_token: String,
+    id: String,
+}
+
+/// Mark one notification read. CSRF-protected like every other browser
+/// mutation, and scoped to the caller's `user_id` in the store, so a user can
+/// only ever clear their own notifications. Returns the refreshed fragment.
+async fn read_customer_notification_form(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Form(form): Form<ReadNotificationForm>,
+) -> Response {
+    let customer = match config.authenticator.authenticate(&headers).await {
+        Ok(customer) => customer,
+        Err(response) => return response,
+    };
+    if let Err(error) = require_form_security(&headers, &config, &customer, &form.csrf_token) {
+        return request_security_error(error);
+    }
+    let Ok(id) = Uuid::parse_str(form.id.trim()) else {
+        return (StatusCode::BAD_REQUEST, "invalid_notification_id").into_response();
+    };
+    let user_id = match caller_user_id(&config, &customer).await {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
+    let pool = match customer_pool(&config) {
+        Ok(pool) => pool,
+        Err(response) => return response,
+    };
+    let message = match store::mark_notification_read(pool, user_id, id).await {
+        Ok(true) => Some("Notification marked read."),
+        Ok(false) => Some("Notification was already read or no longer exists."),
+        Err(error) => return dependency_error("postgres", "notification_read_failed", error),
+    };
+    notifications_fragment_markup(&config, &customer, message).await
+}
+
+async fn notifications_fragment_markup(
+    config: &AppConfig,
+    customer: &CustomerCtx,
+    message: Option<&str>,
+) -> Response {
+    let user_id = match caller_user_id(config, customer).await {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
+    let pool = match customer_pool(config) {
+        Ok(pool) => pool,
+        Err(response) => return response,
+    };
+    let notifications =
+        match store::list_notifications(pool, user_id, DEFAULT_ACTIVITY_LIMIT).await {
+            Ok(rows) => rows,
+            Err(error) => return dependency_error("postgres", "notifications_list_failed", error),
+        };
+    notifications_table_markup(&notifications, message, &customer_csrf_token(config, customer))
+        .into_response()
 }
 
 async fn create_customer_api_key_form(
