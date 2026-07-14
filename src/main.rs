@@ -2279,8 +2279,18 @@ async fn notifications_fragment_markup(
             Ok(rows) => rows,
             Err(error) => return dependency_error("postgres", "notifications_list_failed", error),
         };
-    notifications_table_markup(&notifications, message, &customer_csrf_token(config, customer))
-        .into_response()
+    // True unread total (not just within the shown page) for an accurate badge.
+    let unread = match store::unread_notification_count(pool, user_id).await {
+        Ok(count) => count,
+        Err(error) => return dependency_error("postgres", "notifications_count_failed", error),
+    };
+    notifications_table_markup(
+        &notifications,
+        unread,
+        message,
+        &customer_csrf_token(config, customer),
+    )
+    .into_response()
 }
 
 async fn create_customer_api_key_form(
