@@ -3161,10 +3161,10 @@ fn notifications_markup(org_id: &str) -> Markup {
 
 fn notifications_table_markup(
     notifications: &[entity::customer_notifications::Model],
+    unread: u64,
     message: Option<&str>,
     csrf_token: &str,
 ) -> Markup {
-    let unread = notifications.iter().filter(|n| n.read_at.is_none()).count();
     html! {
         section class="panel" aria-labelledby="notifications-table-heading" {
             div class="panel__header" {
