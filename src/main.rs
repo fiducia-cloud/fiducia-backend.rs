@@ -4741,9 +4741,12 @@ mod tests {
             body_marker.contains("form-action 'self'"),
             "root-served portal must carry the strict portal CSP, got: {body_marker}"
         );
+        // `same-origin`, not `no-referrer`: no-referrer nulls the Origin header
+        // browsers attach to mutations, which would break the same-origin gate
+        // for every real browser (see the security_headers comment).
         assert_eq!(
             response.headers().get(header::REFERRER_POLICY).unwrap(),
-            "no-referrer"
+            "same-origin"
         );
     }
 
