@@ -227,12 +227,6 @@ pub async fn create_notification(
     .await
 }
 
-/// `now()` as a fixed-offset timestamp. Kept in one place so tests and prod
-/// agree on the type SeaORM expects for `timestamptz` columns.
-fn chrono_now() -> sea_orm::prelude::DateTimeWithTimeZone {
-    sea_orm::prelude::DateTimeWithTimeZone::from(std::time::SystemTime::now())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
