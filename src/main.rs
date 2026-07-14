@@ -461,9 +461,16 @@ fn apply_sensitive_response_headers(headers: &mut HeaderMap) {
             "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'; connect-src 'self'; img-src 'self' data:; style-src 'self'",
         ),
     );
+    // `same-origin`, NOT `no-referrer`: under `no-referrer` a browser
+    // serializes the Origin of any non-GET request (form POST, SPA fetch) as
+    // `null`, so `require_same_origin` / `require_api_host` would reject every
+    // real-browser mutation while hand-crafted clients that set Origin
+    // themselves pass — the inversion of the intent. `same-origin` still never
+    // leaks the referrer cross-origin and keeps Origin intact for the gate.
+    // Proven by the real-Chromium journeys in fiducia-e2e (npm run test:browser).
     headers.insert(
         header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
+        HeaderValue::from_static("same-origin"),
     );
 }
 
@@ -4541,9 +4548,12 @@ mod tests {
             body_marker.contains("form-action 'self'"),
             "root-served portal must carry the strict portal CSP, got: {body_marker}"
         );
+        // `same-origin`, not `no-referrer`: no-referrer nulls the Origin header
+        // browsers attach to mutations, which would break the same-origin gate
+        // for every real browser (see the security_headers comment).
         assert_eq!(
             response.headers().get(header::REFERRER_POLICY).unwrap(),
-            "no-referrer"
+            "same-origin"
         );
     }
 
