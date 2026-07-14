@@ -343,4 +343,58 @@ mod tests {
         assert_eq!(list_sessions(&db, mine).await.unwrap()[0].status, "revoked");
         assert_eq!(list_sessions(&db, other).await.unwrap()[0].status, "active");
     }
+
+    #[tokio::test]
+    async fn notifications_are_user_scoped_and_read_marking_is_idempotent() {
+        let Some(db) = db_or_skip().await else {
+            eprintln!("skip notifications_are_user_scoped...: TEST_DATABASE_URL unset");
+            return;
+        };
+        let mine = ensure_user(&db, Uuid::new_v4(), "n-me@example.com")
+            .await
+            .unwrap();
+        let other = ensure_user(&db, Uuid::new_v4(), "n-other@example.com")
+            .await
+            .unwrap();
+
+        let created = create_notification(
+            &db,
+            mine,
+            None,
+            "key.rotation_due",
+            "warning",
+            "Rotate your production key",
+            "The key `fk_live_…ab12` is 85 days old.",
+            Some("/app/security"),
+        )
+        .await
+        .unwrap();
+        // Trigger-assigned sync fields must be populated.
+        assert_eq!(created.version, 1);
+        assert!(created.sync_sequence > 0);
+        assert!(created.read_at.is_none());
+        create_notification(
+            &db, other, None, "mfa.enabled", "success", "MFA on", "", None,
+        )
+        .await
+        .unwrap();
+
+        // Each user sees only their own feed.
+        assert_eq!(list_notifications(&db, mine, 50).await.unwrap().len(), 1);
+        assert_eq!(unread_notification_count(&db, mine).await.unwrap(), 1);
+        assert_eq!(unread_notification_count(&db, other).await.unwrap(), 1);
+
+        // A different user cannot mark my notification read.
+        assert!(!mark_notification_read(&db, other, created.id).await.unwrap());
+        assert_eq!(unread_notification_count(&db, mine).await.unwrap(), 1);
+
+        // The owner marks it read exactly once; the second call is a no-op.
+        assert!(mark_notification_read(&db, mine, created.id).await.unwrap());
+        assert!(!mark_notification_read(&db, mine, created.id).await.unwrap());
+        assert_eq!(unread_notification_count(&db, mine).await.unwrap(), 0);
+        let row = &list_notifications(&db, mine, 50).await.unwrap()[0];
+        assert!(row.read_at.is_some());
+        // The BEFORE UPDATE trigger advanced the row version on read.
+        assert_eq!(row.version, 2);
+    }
 }
