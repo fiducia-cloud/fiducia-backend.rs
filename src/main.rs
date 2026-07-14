@@ -308,6 +308,10 @@ fn build_router(config: AppConfig) -> Router {
             get(customer_sessions_fragment),
         )
         .route("/app/fragments/activity", get(customer_activity_fragment))
+        .route(
+            "/app/fragments/notifications",
+            get(customer_notifications_fragment),
+        )
         // Generated API docs (AGENTS.md "API Docs Contract").
         .route("/docs/api", get(api_docs_html))
         .route("/api/docs", get(api_docs_html))
