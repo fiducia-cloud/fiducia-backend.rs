@@ -1,5 +1,5 @@
-# Customer web assets
+# assets
 
-Static assets served by the Rust customer application. Keep these customer-only
-and free of operator/admin state or secrets. The marketing build synced into
-the public fallback must remain distinguishable from authenticated app assets.
+Static assets served by the customer portal webserver (stylesheets, scripts,
+images). Served verbatim; anything user-visible ships from here rather than
+being inlined in Maud templates.

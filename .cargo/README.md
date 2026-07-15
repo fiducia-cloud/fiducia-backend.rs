@@ -1,5 +1,5 @@
-# Cargo configuration
+# .cargo
 
-Repository-local Cargo settings for the customer web app and BFF. Keep build
-options reproducible; customer identity, database, and cookie configuration are
-runtime secrets documented at the repository root.
+Cargo configuration scoped to this crate. `audit.toml` is the `cargo audit`
+advisory policy CI enforces — any accepted/ignored advisory must be recorded
+here with a justification, so the dependency-audit gate stays reviewable.
