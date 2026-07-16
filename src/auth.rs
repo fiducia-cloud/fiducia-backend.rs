@@ -321,6 +321,59 @@ mod tests {
     }
 
     #[test]
+    fn explicit_bearer_beats_ambient_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer explicit.jwt".parse().unwrap());
+        headers.insert(
+            "cookie",
+            format!("{CUSTOMER_SESSION_COOKIE}=ambient.jwt")
+                .parse()
+                .unwrap(),
+        );
+        match presented_credential(&headers) {
+            CredentialSelection::Valid(credential) => {
+                assert_eq!(credential.token, "explicit.jwt");
+                assert!(
+                    !credential.cookie_authenticated,
+                    "an explicit Authorization credential must not be tagged as cookie-borne"
+                );
+            }
+            _ => panic!("explicit bearer plus ambient cookie must select the bearer"),
+        }
+        assert_eq!(bearer_token(&headers).as_deref(), Some("explicit.jwt"));
+    }
+
+    /// A verified user with no org membership is FORBIDDEN (403), not treated
+    /// as unauthenticated and not admitted with an empty scope.
+    #[tokio::test]
+    async fn empty_org_membership_is_forbidden() {
+        use axum::routing::get;
+        let app = axum::Router::new().route(
+            "/v1/me",
+            get(|| async {
+                Json(json!({
+                    "user": { "user_id": "user-1", "email": "u@example.com", "orgs": [] }
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let auth = Authenticator::AuthService(url);
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer orgless.jwt".parse().unwrap());
+        let denied = auth
+            .authenticate(&headers)
+            .await
+            .expect_err("a user with zero org memberships must be denied");
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        server.abort();
+    }
+
+    #[test]
     fn malformed_authorization_never_downgrades_to_cookie() {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, "Basic not-a-bearer".parse().unwrap());
