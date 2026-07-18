@@ -20,8 +20,11 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
-use axum::{routing::get, Json, Router};
-use maud::{html, Markup, DOCTYPE};
+use axum::{
+    routing::{get, post},
+    Json, Router,
+};
+use maud::{html, Markup, PreEscaped, DOCTYPE};
 use request_security::{RequestSecurity, RequestSecurityError};
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 use serde::{Deserialize, Serialize};
