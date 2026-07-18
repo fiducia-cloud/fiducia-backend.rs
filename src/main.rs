@@ -129,13 +129,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Connect to the customer Postgres plane. Production startup fails closed when
 /// `DATABASE_URL` is absent or unreachable.
+///
+/// The customer plane lives in the dedicated `fiducia` Postgres schema (declared
+/// in k8s-cluster `remote/libs/pg-defs` and converged onto AWS RDS via dpm), so
+/// the shared RDS instance can host many apps without table-name collisions. The
+/// SeaORM entities reference bare table names, so we pin the connection's
+/// `search_path` to that schema. `FIDUCIA_DB_SCHEMA` overrides it (e.g. `public`
+/// for a legacy Supabase database); `pg_catalog` is always implicitly first, so
+/// `gen_random_uuid()` and friends still resolve.
 async fn connect_customer_db() -> Result<DatabaseConnection, Box<dyn std::error::Error>> {
     let url = required_env("DATABASE_URL")?;
+    let schema = std::env::var("FIDUCIA_DB_SCHEMA")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "fiducia".to_string());
     let mut options = ConnectOptions::new(url);
     options.max_connections(5).sqlx_logging(false);
+    options.set_schema_search_path(schema.clone());
     let pool = Database::connect(options).await?;
     pool.ping().await?;
-    tracing::info!("customer DB connected — customer state is durable");
+    tracing::info!(%schema, "customer DB connected (search_path pinned) — customer state is durable");
     Ok(pool)
 }
 
