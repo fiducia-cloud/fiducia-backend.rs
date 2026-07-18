@@ -49,14 +49,6 @@ impl OtpChannel {
             OtpChannel::Phone => "sms",
         }
     }
-
-    /// Human label for prompts and audit lines.
-    pub const fn label(self) -> &'static str {
-        match self {
-            OtpChannel::Email => "email",
-            OtpChannel::Phone => "phone",
-        }
-    }
 }
 
 /// A Supabase-issued session. `access_token` is the bearer this service forwards
