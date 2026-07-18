@@ -51,6 +51,11 @@ pub struct CustomerCtx {
     pub email: Option<String>,
     /// Orgs the user belongs to (admin-controlled claims; see fiducia-auth).
     pub orgs: Vec<String>,
+    /// The verified Supabase Authenticator Assurance Level forwarded by
+    /// fiducia-auth. Missing values are deliberately single-factor so a legacy
+    /// auth response can never accidentally bypass MFA enforcement.
+    #[serde(default = "default_assurance_level")]
+    pub aal: String,
     /// Opaque request-CSRF HMAC input. Never render or log this value.
     #[serde(skip)]
     pub(crate) credential_binding: String,
@@ -66,6 +71,14 @@ impl CustomerCtx {
     pub fn is_browser_session(&self) -> bool {
         self.cookie_authenticated || self.credential_binding.starts_with("development\0")
     }
+
+    pub fn is_aal2(&self) -> bool {
+        self.aal == "aal2"
+    }
+}
+
+fn default_assurance_level() -> String {
+    "aal1".to_string()
 }
 
 /// How a request is authenticated. Production verifies via fiducia-auth; tests
@@ -104,6 +117,7 @@ impl Authenticator {
                 user_id: "fiducia-e2e-customer".to_string(),
                 email: Some("customer-e2e@fiducia.invalid".to_string()),
                 orgs: vec!["00000000-0000-4000-8000-000000000001".to_string()],
+                aal: "aal2".to_string(),
                 credential_binding: "development\0fiducia-e2e-customer".to_string(),
                 cookie_authenticated: false,
             }));
