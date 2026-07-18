@@ -4863,10 +4863,17 @@ mod tests {
     async fn customer_login_is_server_mediated_and_issues_only_customer_cookie() {
         const MOCK_SUPABASE_TOKEN_PATH: &str = "/auth/v1/token";
         const MOCK_AUTH_ME_PATH: &str = "/v1/me";
-        let supabase = Router::new().route(
-            MOCK_SUPABASE_TOKEN_PATH,
-            axum::routing::post(|| async { Json(json!({ "access_token": "customer.jwt" })) }),
-        );
+        let supabase = Router::new()
+            .route(
+                MOCK_SUPABASE_TOKEN_PATH,
+                axum::routing::post(|| async { Json(json!({ "access_token": "customer.jwt" })) }),
+            )
+            // The login now runs a fail-closed MFA factor lookup before issuing a
+            // session; this account has no enrolled factor, so login finalizes.
+            .route(
+                "/auth/v1/user",
+                get(|| async { Json(json!({ "factors": [] })) }),
+            );
         let auth = Router::new().route(
             MOCK_AUTH_ME_PATH,
             get(|| async {
