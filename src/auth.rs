@@ -276,6 +276,35 @@ fn authorization_token(headers: &HeaderMap) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// The portal must FAIL CLOSED when its identity dependency is broken:
+    /// unconfigured auth denies with 503, and an unreachable auth service
+    /// denies with 503 — a presented credential is never trusted, and no
+    /// unauthenticated fall-through exists on either path.
+    #[tokio::test]
+    async fn identity_outage_denies_instead_of_falling_through() {
+        // Unconfigured deployment: every customer route is refused.
+        let deny_all = Authenticator::Deny;
+        let denied = deny_all
+            .authenticate(&HeaderMap::new())
+            .await
+            .expect_err("unconfigured auth must deny");
+        assert_eq!(denied.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Configured but DOWN: a well-formed session credential still denies.
+        // Bind-then-drop a listener so the port refuses connections.
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_url = format!("http://{}", dead.local_addr().unwrap());
+        drop(dead);
+        let unreachable = Authenticator::AuthService(dead_url);
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer plausible.jwt".parse().unwrap());
+        let refused = unreachable
+            .authenticate(&headers)
+            .await
+            .expect_err("an unreachable identity provider must deny, never trust");
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     #[test]
     fn customer_cookie_is_isolated_from_admin_cookie() {
         let mut headers = HeaderMap::new();
@@ -289,6 +318,59 @@ mod tests {
 
         headers.insert("cookie", "fiducia_admin_session=admin.jwt".parse().unwrap());
         assert_eq!(bearer_token(&headers), None);
+    }
+
+    #[test]
+    fn explicit_bearer_beats_ambient_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer explicit.jwt".parse().unwrap());
+        headers.insert(
+            "cookie",
+            format!("{CUSTOMER_SESSION_COOKIE}=ambient.jwt")
+                .parse()
+                .unwrap(),
+        );
+        match presented_credential(&headers) {
+            CredentialSelection::Valid(credential) => {
+                assert_eq!(credential.token, "explicit.jwt");
+                assert!(
+                    !credential.cookie_authenticated,
+                    "an explicit Authorization credential must not be tagged as cookie-borne"
+                );
+            }
+            _ => panic!("explicit bearer plus ambient cookie must select the bearer"),
+        }
+        assert_eq!(bearer_token(&headers).as_deref(), Some("explicit.jwt"));
+    }
+
+    /// A verified user with no org membership is FORBIDDEN (403), not treated
+    /// as unauthenticated and not admitted with an empty scope.
+    #[tokio::test]
+    async fn empty_org_membership_is_forbidden() {
+        use axum::routing::get;
+        let app = axum::Router::new().route(
+            "/v1/me",
+            get(|| async {
+                Json(json!({
+                    "user": { "user_id": "user-1", "email": "u@example.com", "orgs": [] }
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let auth = Authenticator::AuthService(url);
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer orgless.jwt".parse().unwrap());
+        let denied = auth
+            .authenticate(&headers)
+            .await
+            .expect_err("a user with zero org memberships must be denied");
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        server.abort();
     }
 
     #[test]
