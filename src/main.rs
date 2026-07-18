@@ -579,7 +579,7 @@ async fn security_headers(
             ctx.customer_site_mode,
         );
     let sensitive = root_is_portal
-        || path == "/login"
+        || path.starts_with("/login")
         || path == "/logout"
         || path.starts_with("/app")
         || path.starts_with("/api/customer");
