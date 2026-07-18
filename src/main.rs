@@ -787,6 +787,20 @@ fn clear_customer_session_cookie() -> String {
     )
 }
 
+fn make_customer_mfa_pending_cookie(token: &str) -> String {
+    format!(
+        "{CUSTOMER_MFA_PENDING_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={MFA_PENDING_MAX_AGE_SECS}{}",
+        cookie_secure_suffix()
+    )
+}
+
+fn clear_customer_mfa_pending_cookie() -> String {
+    format!(
+        "{CUSTOMER_MFA_PENDING_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
+        cookie_secure_suffix()
+    )
+}
+
 #[derive(Debug, Deserialize)]
 struct CustomerLogoutForm {
     csrf_token: String,
