@@ -53,7 +53,11 @@ impl OtpChannel {
 
 /// A Supabase-issued session. `access_token` is the bearer this service forwards
 /// to fiducia-auth and stores in the `__Host-fiducia_customer_session` cookie.
+/// The remaining fields mirror the GoTrue response verbatim; they are parsed for
+/// contract fidelity (and future silent-refresh support) even though only the
+/// access token is consumed today.
 #[derive(Clone, Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct SupabaseSession {
     pub access_token: String,
     #[serde(default)]
