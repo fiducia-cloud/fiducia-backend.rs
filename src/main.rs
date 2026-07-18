@@ -6,11 +6,13 @@ mod auth;
 mod entity;
 mod request_security;
 mod store;
+mod supabase_auth;
 
 use auth::{
     bearer_token, cookie_value, Authenticator, CustomerCtx, CUSTOMER_LOGIN_CSRF_COOKIE,
     CUSTOMER_SESSION_COOKIE,
 };
+use supabase_auth::{required_totp_factor, OtpChannel, SupabaseAuth, SupabaseAuthError};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::Request;
 use axum::extract::{Form, Path, Query, State};
