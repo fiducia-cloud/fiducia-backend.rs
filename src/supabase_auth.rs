@@ -49,19 +49,15 @@ impl OtpChannel {
             OtpChannel::Phone => "sms",
         }
     }
-
-    /// Human label for prompts and audit lines.
-    pub const fn label(self) -> &'static str {
-        match self {
-            OtpChannel::Email => "email",
-            OtpChannel::Phone => "phone",
-        }
-    }
 }
 
 /// A Supabase-issued session. `access_token` is the bearer this service forwards
 /// to fiducia-auth and stores in the `__Host-fiducia_customer_session` cookie.
+/// The remaining fields mirror the GoTrue response verbatim; they are parsed for
+/// contract fidelity (and future silent-refresh support) even though only the
+/// access token is consumed today.
 #[derive(Clone, Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct SupabaseSession {
     pub access_token: String,
     #[serde(default)]
@@ -123,17 +119,6 @@ pub enum SupabaseAuthError {
     /// Transport failure or a non-JSON / unparseable success body — treat as a
     /// dependency outage, never as an authenticated result.
     Unavailable(String),
-}
-
-impl SupabaseAuthError {
-    /// Stable machine code for structured JSON error responses and logs.
-    pub const fn code(&self) -> &'static str {
-        match self {
-            SupabaseAuthError::Invalid(_) => "supabase_auth_invalid_input",
-            SupabaseAuthError::Rejected(_) => "supabase_auth_rejected",
-            SupabaseAuthError::Unavailable(_) => "supabase_auth_unavailable",
-        }
-    }
 }
 
 impl std::fmt::Display for SupabaseAuthError {
