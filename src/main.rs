@@ -298,6 +298,11 @@ fn build_router(config: AppConfig) -> Router {
             axum::routing::post(revoke_customer_api_key_form),
         )
         .route("/app/security", get(customer_security))
+        // Authenticator (TOTP) enrollment + lifecycle on the Security surface.
+        .route("/app/security/mfa", get(customer_mfa_page))
+        .route("/app/security/mfa/enroll", post(customer_mfa_enroll))
+        .route("/app/security/mfa/activate", post(customer_mfa_activate))
+        .route("/app/security/mfa/disable", post(customer_mfa_disable))
         .route("/app/activity", get(customer_activity))
         .route("/app/notifications", get(customer_notifications))
         .route(
