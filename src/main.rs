@@ -1077,7 +1077,7 @@ fn otp_verify_markup(
     };
     let blurb = match channel {
         OtpChannel::Email => {
-            "We emailed a magic link and a 6-digit code. Enter the code, or just tap the link."
+            "We emailed you a 6-digit code. Enter it below."
         }
         OtpChannel::Phone => "We texted a 6-digit code to your phone. Enter it below.",
     };
