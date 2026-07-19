@@ -1208,6 +1208,30 @@ async fn customer_login_otp_submit(
         );
     };
     let identifier = form.identifier.trim().to_string();
+    // Two budgets, two different abuses. Per-identifier stops a victim being
+    // spammed with texts/mail they never asked for; per-client caps what one
+    // caller can bill us when it rotates the destination every request (SMS
+    // pumping). Both are checked BEFORE `send_otp` — the cost is the dispatch.
+    let identifier_budget =
+        throttle::check(throttle::Bucket::OtpDispatchPerIdentifier, &identifier);
+    if !identifier_budget.allowed {
+        return throttled_response(
+            login_flow_page(&config, |token| {
+                otp_verify_markup(channel, &identifier, token, Some(THROTTLE_MESSAGE))
+            }),
+            identifier_budget.retry_after_secs,
+        );
+    }
+    let client_budget = throttle::check(
+        throttle::Bucket::OtpDispatchPerClient,
+        &throttle_client_key(&headers),
+    );
+    if !client_budget.allowed {
+        return throttled_response(
+            customer_login_page(&config, Some(THROTTLE_MESSAGE)),
+            client_budget.retry_after_secs,
+        );
+    }
     match supabase.send_otp(channel, &identifier, true).await {
         Ok(()) => login_flow_page(&config, |token| {
             otp_verify_markup(channel, &identifier, token, None)
