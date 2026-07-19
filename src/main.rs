@@ -971,6 +971,12 @@ async fn customer_logout(
     }
     let mut response = (StatusCode::SEE_OTHER, [(header::LOCATION, "/login")]).into_response();
     append_set_cookie(&mut response, &clear_customer_session_cookie());
+    // Clear the transient login cookies too. A user who abandons a half-finished
+    // step-up and then signs out would otherwise leave a live pre-2FA Supabase
+    // bearer in the browser for the rest of its 300s window — on a shared
+    // machine that is a residual credential, and "sign out" must mean all of it.
+    append_set_cookie(&mut response, &clear_customer_mfa_pending_cookie());
+    append_set_cookie(&mut response, &clear_customer_login_csrf_cookie());
     response
 }
 
