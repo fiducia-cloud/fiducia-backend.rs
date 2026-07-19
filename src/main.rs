@@ -817,6 +817,35 @@ fn customer_login_page(config: &AppConfig, message: Option<&str>) -> Response {
     login_flow_page(config, |token| customer_login_markup(message, token))
 }
 
+/// The client identity for per-client throttle buckets. See
+/// [`throttle::client_key`] for why only the LAST `X-Forwarded-For` hop is
+/// trustworthy behind the nginx gateway.
+fn throttle_client_key(headers: &HeaderMap) -> String {
+    throttle::client_key(
+        headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok()),
+    )
+}
+
+/// Refuse an over-budget attempt: 429 + `Retry-After`, re-rendering `page` so the
+/// user still gets a usable form.
+///
+/// The message is deliberately generic and identical whether or not the
+/// identifier exists — a throttle response must not become the account-existence
+/// oracle that the rest of this flow is careful to avoid.
+fn throttled_response(page: Response, retry_after_secs: u64) -> Response {
+    let mut response = page;
+    *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+const THROTTLE_MESSAGE: &str =
+    "Too many attempts. Wait a few minutes before trying again.";
+
 fn require_login_security(
     headers: &HeaderMap,
     config: &AppConfig,
