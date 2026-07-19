@@ -1358,6 +1358,24 @@ async fn customer_login_mfa_submit(
             "SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY are required",
         );
     };
+    // The challenge is deliberately kept alive across wrong codes so a user can
+    // retry the current one — which equally lets an attacker holding the primary
+    // factor grind the second. This cap is what makes the second factor an
+    // actual barrier rather than a delegated one.
+    let step_up_budget = throttle::check(
+        throttle::Bucket::MfaVerifyPerClient,
+        &throttle_client_key(&headers),
+    );
+    if !step_up_budget.allowed {
+        let factor = form.factor_id.clone();
+        let challenge_id = form.challenge_id.clone();
+        return throttled_response(
+            login_flow_page(&config, |token| {
+                mfa_challenge_markup(&factor, &challenge_id, token, Some(THROTTLE_MESSAGE))
+            }),
+            step_up_budget.retry_after_secs,
+        );
+    }
     let challenge = supabase_auth::TotpChallenge {
         challenge_id: form.challenge_id.clone(),
         factor_id: form.factor_id.clone(),
