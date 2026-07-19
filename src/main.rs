@@ -385,12 +385,6 @@ fn build_router(config: AppConfig) -> Router {
             header::CONTENT_SECURITY_POLICY,
             HeaderValue::from_static("upgrade-insecure-requests"),
         ))
-        // Hardening stack (outermost last): catch handler panics, bound request
-        // time, and cap body size.
-        .layer(TraceLayer::new_for_http())
-        .layer(TimeoutLayer::new(Duration::from_secs(REQUEST_TIMEOUT_SECS)))
-        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
-        .layer(CatchPanicLayer::new())
         // The login-flow fix prevents a new password grant from becoming a
         // session before TOTP, but this is the token-level backstop: every
         // authenticated customer surface rejects an `aal1` token when Supabase
@@ -408,7 +402,19 @@ fn build_router(config: AppConfig) -> Router {
         .layer(middleware::from_fn_with_state(
             sensitive_header_context,
             security_headers,
-        ));
+        ))
+        // Hardening stack, applied LAST so it is genuinely OUTERMOST.
+        //
+        // Ordering is a correctness property, not style: `.layer()` wraps what
+        // came before, so anything added after these runs outside them. When the
+        // gates above were layered last they escaped both guards — the AAL gate
+        // calls `fiducia-auth` over the network, so a hung upstream ignored
+        // `REQUEST_TIMEOUT_SECS` entirely and a panic inside a gate bypassed
+        // `CatchPanicLayer` and killed the connection. Keep these at the bottom.
+        .layer(TraceLayer::new_for_http())
+        .layer(CatchPanicLayer::new())
+        .layer(TimeoutLayer::new(Duration::from_secs(REQUEST_TIMEOUT_SECS)))
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES));
 
     match customer_app_origin {
         Some(origin) => router.layer(customer_cors(origin)),
