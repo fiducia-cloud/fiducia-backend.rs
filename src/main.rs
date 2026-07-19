@@ -1198,7 +1198,7 @@ async fn finalize_customer_login(config: &AppConfig, access_token: &str) -> Resp
     response
 }
 
-/// `POST /login/otp` — dispatch a magic link / one-time code over email or phone.
+/// `POST /login/otp` — dispatch a one-time code over email or phone.
 /// `should_create_user` is true so this doubles as self-service signup.
 async fn customer_login_otp_submit(
     State(config): State<AppConfig>,
