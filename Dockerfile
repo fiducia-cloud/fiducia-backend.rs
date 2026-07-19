@@ -18,6 +18,7 @@ RUN cargo build --locked --release && strip target/release/fiducia-backend
 
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:66aa873a4a14fb164aa01296058efd8253744606d72715e45acface073359faa
 COPY --from=build --chown=65532:65532 /build/fiducia-customer.rs/target/release/fiducia-backend /usr/local/bin/fiducia-backend
+COPY --from=build --chown=65532:65532 /build/fiducia-customer.rs/static /app/static
 ENV STATIC_DIR=/app/static
 EXPOSE 8080
 USER 65532:65532
