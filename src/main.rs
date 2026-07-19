@@ -732,6 +732,15 @@ async fn customer_login_submit(
         *response.status_mut() = StatusCode::BAD_REQUEST;
         return response;
     }
+    // Bound credential stuffing against one account before spending an upstream
+    // round trip on it.
+    let password_budget = throttle::check(throttle::Bucket::PasswordPerIdentifier, email);
+    if !password_budget.allowed {
+        return throttled_response(
+            customer_login_page(&config, Some(THROTTLE_MESSAGE)),
+            password_budget.retry_after_secs,
+        );
+    }
     let (Some(supabase_url), Some(publishable_key)) = (
         config.supabase_url.as_deref(),
         config.supabase_publishable_key.as_deref(),
