@@ -50,7 +50,7 @@ pub async fn webhook(
 
     let verified = match verify(provider, &headers, &body).await {
         Ok(event) => event,
-        Err(response) => return response,
+        Err(reject) => return reject.response(),
     };
 
     match record(&config, &verified, &body).await {
