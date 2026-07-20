@@ -228,6 +228,10 @@ async fn fetch_cert(cert_url: &str) -> Result<String, reqwest::Error> {
     let client = CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .timeout(Duration::from_secs(CERT_FETCH_TIMEOUT_SECS))
+            // Never follow redirects: the host gate validated the *cert_url*, but
+            // a 30x from a genuine paypal.com URL to an attacker host would slip
+            // past it. Pin the fetch to the URL we approved.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("paypal cert client must build")
     });
