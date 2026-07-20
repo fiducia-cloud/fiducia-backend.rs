@@ -69,13 +69,41 @@ pub async fn webhook(
     }
 }
 
-/// Verify the signature for `provider` and return the authenticated event, or an
-/// HTTP error response to return verbatim.
+/// Why a webhook was rejected before it could be recorded. Kept small (no
+/// `Response` inside) so the hot Result stays cheap; mapped to an opaque HTTP
+/// response once, at the handler boundary.
+enum Reject {
+    /// Provider is known but its secret is unset — fail closed rather than
+    /// accept unverifiable events.
+    NotConfigured,
+    /// A required signature header was absent.
+    MissingHeader,
+    /// The PayPal verification certificate could not be fetched.
+    CertFetchFailed,
+    /// The signature did not verify (forged, wrong secret, stale, tampered).
+    Signature,
+}
+
+impl Reject {
+    fn response(&self) -> Response {
+        match self {
+            // Opaque to the caller: a prober learns only "rejected"; the specific
+            // reason is logged where the reject is raised.
+            Reject::NotConfigured => deny(StatusCode::SERVICE_UNAVAILABLE, "provider_not_configured"),
+            Reject::MissingHeader => deny(StatusCode::BAD_REQUEST, "missing_signature_header"),
+            Reject::CertFetchFailed => deny(StatusCode::BAD_GATEWAY, "cert_fetch_failed"),
+            Reject::Signature => deny(StatusCode::BAD_REQUEST, "signature_verification_failed"),
+        }
+    }
+}
+
+/// Verify the signature for `provider` and return the authenticated event, or a
+/// [`Reject`] the caller maps to an HTTP response.
 async fn verify(
     provider: Provider,
     headers: &HeaderMap,
     body: &Bytes,
-) -> Result<VerifiedEvent, Response> {
+) -> Result<VerifiedEvent, Reject> {
     match provider {
         Provider::Stripe => {
             let secret = env_secret("STRIPE_WEBHOOK_SECRET")?;
@@ -89,13 +117,12 @@ async fn verify(
             // Gate the URL BEFORE fetching it: fetching an attacker-controlled
             // cert URL would be an SSRF. `paypal::verify` re-checks as well.
             if !paypal::cert_url_is_paypal(&cert_url) {
-                return Err(reject(fiducia_payments::VerifyError::InvalidInput(
-                    "cert url not a PayPal host".into(),
-                )));
+                tracing::warn!(%cert_url, "paypal cert url is not a PayPal host");
+                return Err(Reject::Signature);
             }
             let cert_pem = fetch_cert(&cert_url).await.map_err(|error| {
                 tracing::warn!(%error, "paypal cert fetch failed");
-                deny(StatusCode::BAD_GATEWAY, "cert_fetch_failed")
+                Reject::CertFetchFailed
             })?;
             let transmission = paypal::Transmission {
                 transmission_id: &header(headers, "paypal-transmission-id")?,
